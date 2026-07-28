@@ -330,6 +330,13 @@ Describe 'Phase 3 production marker evidence validation' {
         $launcher | Should Match 'Resolve-Phase3ContainedPath'
         $launcher | Should Match '-AuthCache \$authCacheFull'
         $launcher | Should Match '-ScenarioManifestPath \$scenarioManifestPath'
+        $launcher | Should Match '\[Collections\.Generic\.List\[object\]\]::new\(\)'
+    }
+
+    It 'serializes empty screenshot evidence as a JSON array under Windows PowerShell' {
+        $slots = [Collections.Generic.List[object]]::new()
+        $json = [ordered]@{ screenshot_slots = $slots } | ConvertTo-Json -Depth 2
+        $json | Should Match '"screenshot_slots"\s*:\s*\['
     }
 
     It 'rejects an untracked source file when proving a clean candidate HEAD' {
