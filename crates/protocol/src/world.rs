@@ -265,6 +265,19 @@ pub struct LevelChunkEvent {
     pub payload: Vec<u8>,
 }
 
+/// Requests a fresh, ordinary SubChunk column after one cached transaction was abandoned.
+///
+/// This is recovery control data, not substitute chunk content. The world streamer routes it
+/// through the normal bounded request and retry scheduler.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChunkResyncEvent {
+    pub dimension: i32,
+    pub x: i32,
+    pub z: i32,
+    /// `None` requests the dimension's full vanilla vertical range.
+    pub requested_sub_chunks: Option<usize>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SubChunkUnavailable {
     Undefined,
@@ -326,6 +339,18 @@ pub struct PublisherUpdateEvent {
 pub struct ChangeDimensionEvent {
     pub dimension: i32,
     pub position: [f32; 3],
+}
+
+/// One server-driven local-player respawn phase.
+///
+/// The wire state and runtime ID are retained even when semantically unusual;
+/// every well-formed respawn packet changes local position authority and must
+/// reach the app instead of being silently dropped.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RespawnEvent {
+    pub position: [f32; 3],
+    pub state: u8,
+    pub runtime_entity_id: i64,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
@@ -457,12 +482,14 @@ pub struct BiomeDefinitionsEvent {
 pub enum WorldEvent {
     BiomeDefinitions(BiomeDefinitionsEvent),
     LevelChunk(LevelChunkEvent),
+    ChunkResync(ChunkResyncEvent),
     SubChunks(SubChunkBatchEvent),
     BlockUpdates(Vec<BlockUpdateEvent>),
     BlockEntityUpdate(BlockEntityUpdateEvent),
     ChunkRadiusUpdated(i32),
     PublisherUpdate(PublisherUpdateEvent),
     ChangeDimension(ChangeDimensionEvent),
+    Respawn(RespawnEvent),
     MovePlayer(MovePlayerEvent),
     PlayerMovementCorrection(PlayerMovementCorrectionEvent),
     SetTime(SetTimeEvent),
@@ -800,6 +827,11 @@ pub fn into_world_event(
                 position: [packet.position.x, packet.position.y, packet.position.z],
             })
         }
+        McpePacketData::PacketRespawn(packet) => WorldEvent::Respawn(RespawnEvent {
+            position: [packet.position.x, packet.position.y, packet.position.z],
+            state: packet.state,
+            runtime_entity_id: packet.runtime_entity_id,
+        }),
         McpePacketData::PacketMovePlayer(packet) => {
             let mode = MovePlayerMode::from(packet.mode);
             WorldEvent::MovePlayer(MovePlayerEvent {

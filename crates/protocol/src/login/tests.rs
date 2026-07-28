@@ -72,8 +72,8 @@ use valentine::bedrock::version::v1_26_30::{
     CorrectPlayerMovePredictionPacket, GameRuleI32, GameRuleI32Type, GameRuleI32Value,
     GameRulesChangedPacket, ItemNew, ItemRegistryPacket, LevelChunkPacket, LevelChunkPacketBlobs,
     LevelEventPacket, LevelEventPacketEvent, McpePacketName, MobEquipmentPacket, MovePlayerPacket,
-    SetTimePacket, TextPacket, TextPacketCategory, TextPacketContent, TextPacketContentJson,
-    TextPacketType, UpdateBlockPacket, Vec2F, Vec3F, WindowId,
+    RespawnPacket, SetTimePacket, TextPacket, TextPacketCategory, TextPacketContent,
+    TextPacketContentJson, TextPacketType, UpdateBlockPacket, Vec2F, Vec3F, WindowId,
 };
 
 fn raw_packet(id: McpePacketName, body: &[u8]) -> jolyne::raw::RawPacket {
@@ -133,7 +133,7 @@ fn fast_transfer_arm_is_consumed_only_after_a_chunk_candidate_decodes() {
             .into(),
         )
         .expect("old unresolved transaction");
-    resolver.arm_fast_transfer_rotation();
+    resolver.arm_fast_transfer_reset();
 
     let session = BedrockSession { shield_item_id: 0 };
     let malformed = raw_packet(McpePacketName::PacketLevelChunk, &[0xff]);
@@ -142,7 +142,7 @@ fn fast_transfer_arm_is_consumed_only_after_a_chunk_candidate_decodes() {
 
     let ordinary: crate::Packet = SetTimePacket { time: 7 }.into();
     assert!(
-        !rotate_blob_cache_for_decoded_candidate(&mut resolver, &ordinary)
+        !reset_blob_cache_for_decoded_candidate(&mut resolver, &ordinary)
             .expect("ordinary decoded packet is not a candidate")
     );
     assert_eq!(resolver.stats().pending_transactions, 1);
@@ -154,13 +154,35 @@ fn fast_transfer_arm_is_consumed_only_after_a_chunk_candidate_decodes() {
     }
     .into();
     assert!(
-        rotate_blob_cache_for_decoded_candidate(&mut resolver, &candidate)
+        reset_blob_cache_for_decoded_candidate(&mut resolver, &candidate)
             .expect("successfully decoded candidate consumes the arm")
     );
     assert_eq!(resolver.stats().pending_transactions, 0);
     assert!(
-        !rotate_blob_cache_for_decoded_candidate(&mut resolver, &candidate)
+        !reset_blob_cache_for_decoded_candidate(&mut resolver, &candidate)
             .expect("arm is one-shot")
+    );
+}
+
+#[test]
+fn malformed_cached_chunk_wire_remains_a_fatal_session_error() {
+    let session = BedrockSession { shield_item_id: 0 };
+    let malformed = raw_packet(McpePacketName::PacketLevelChunk, &[0xff]);
+
+    let error = decode_world_raw_with(malformed, 0, |raw| raw.decode(&session))
+        .expect_err("truncated cached LevelChunk wire must fail closed");
+
+    assert!(matches!(error, ProtocolError::Session(_)));
+}
+
+#[test]
+fn malformed_cache_miss_response_wire_remains_a_fatal_decode_error() {
+    let session = BedrockSession { shield_item_id: 0 };
+    let truncated = raw_packet(McpePacketName::PacketClientCacheMissResponse, &[0x01]);
+
+    assert!(
+        truncated.decode(&session).is_err(),
+        "a declared blob without its hash and payload must fail closed in raw decode"
     );
 }
 
@@ -605,6 +627,42 @@ fn allowlisted_move_player_is_materialized_and_normalized() {
             on_ground: false,
             teleported: false,
             source_tick: 0,
+        })
+    );
+}
+
+#[test]
+fn allowlisted_respawn_is_materialized_and_normalized() {
+    let session = BedrockSession { shield_item_id: 0 };
+    let packet: Packet = RespawnPacket {
+        position: Vec3F {
+            x: 8.5,
+            y: 71.620_01,
+            z: -4.25,
+        },
+        state: 1,
+        runtime_entity_id: 42,
+    }
+    .into();
+    let mut batch = crate::encode(&packet, &session).expect("encode respawn");
+    batch.advance(1);
+    let raw = decode_packet_raw(&mut batch).expect("raw respawn");
+    let decoder_called = Cell::new(false);
+
+    let event = decode_world_raw_with(raw, 0, |raw| {
+        decoder_called.set(true);
+        raw.decode(&session)
+    })
+    .expect("decode respawn")
+    .expect("respawn event");
+
+    assert!(decoder_called.get());
+    assert_eq!(
+        event,
+        WorldEvent::Respawn(crate::RespawnEvent {
+            position: [8.5, 71.620_01, -4.25],
+            state: 1,
+            runtime_entity_id: 42,
         })
     );
 }

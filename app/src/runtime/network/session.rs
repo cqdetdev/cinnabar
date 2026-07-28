@@ -1,5 +1,5 @@
 use std::{
-    future::Future,
+    io::Write,
     path::PathBuf,
     thread::{self, JoinHandle},
     time::{Duration, Instant},
@@ -13,12 +13,17 @@ use protocol::{
 use tokio::sync::{mpsc, watch};
 use world::ChunkKey;
 
-use crate::{acceptance::mutation::write_stdout_marker, ui_runtime::FastTransferAction};
+use crate::{
+    acceptance::mutation::write_stdout_marker,
+    movement::{MovementTicker, PhysicsSendIdentity},
+    ui_runtime::FastTransferAction,
+};
 
 pub(crate) const WORLD_EVENT_CAPACITY: usize = 32;
 const CONTROL_EVENT_CAPACITY: usize = 64;
 const COMMAND_CAPACITY: usize = 64;
 const FINAL_CONTROL_FLUSH_TIMEOUT: Duration = Duration::from_millis(250);
+const NETWORK_PUMP_TERMINAL_MARKER: &str = "RUST_MCBE_NETWORK_PUMP_TERMINAL";
 
 #[derive(Debug, Clone)]
 pub struct NetworkConfig {
@@ -52,6 +57,13 @@ pub enum NetworkControlEvent {
         session: u64,
         sequence: u64,
         message: String,
+    },
+    PhysicsPacketSent {
+        identity: PhysicsSendIdentity,
+    },
+    PhysicsPacketCancelled {
+        identity: PhysicsSendIdentity,
+        definitely_unsent: bool,
     },
     BlobCacheTelemetry {
         enabled: bool,
@@ -93,6 +105,8 @@ enum NetworkCommand {
         packet: Packet,
         sub_chunk: Option<SubChunkRequestSend>,
         chat: Option<ChatPacketSend>,
+        physics: Option<PhysicsSendIdentity>,
+        physics_reanchor: Option<watch::Receiver<u64>>,
     },
 }
 
@@ -146,11 +160,36 @@ pub struct NetworkHandle {
     control_events: mpsc::Receiver<NetworkControlEvent>,
     world_events: mpsc::Receiver<WorldIngress>,
     commands: mpsc::Sender<NetworkCommand>,
+    physics_reanchor: watch::Sender<u64>,
     shutdown: watch::Sender<bool>,
     thread: Option<JoinHandle<()>>,
 }
 
 impl NetworkHandle {
+    #[cfg(test)]
+    pub(crate) fn stub() -> (Self, watch::Receiver<u64>) {
+        let (_control_event_tx, control_events) = mpsc::channel(1);
+        let (_world_event_tx, world_events) = mpsc::channel(1);
+        let (commands, _command_rx) = mpsc::channel(1);
+        let (physics_reanchor, physics_reanchor_rx) = watch::channel(0);
+        let (shutdown, _shutdown_rx) = watch::channel(false);
+        (
+            Self {
+                control_events,
+                world_events,
+                commands,
+                physics_reanchor,
+                shutdown,
+                thread: None,
+            },
+            physics_reanchor_rx,
+        )
+    }
+
+    pub(crate) fn movement_ticker(&self) -> MovementTicker {
+        MovementTicker::with_epoch_publisher(self.physics_reanchor.clone())
+    }
+
     pub fn control_events_mut(&mut self) -> &mut mpsc::Receiver<NetworkControlEvent> {
         &mut self.control_events
     }
@@ -173,8 +212,23 @@ impl NetworkHandle {
             .saturating_sub(self.commands.capacity())
     }
 
+    #[cfg(test)]
     pub fn send_packet(&self, packet: Packet) -> Result<(), PacketSendError> {
-        self.send_packet_with_confirmation(packet, None, None)
+        self.send_packet_with_confirmation(packet, None, None, None, None)
+    }
+
+    pub(crate) fn send_physics_packet(
+        &self,
+        identity: PhysicsSendIdentity,
+        packet: Packet,
+    ) -> Result<(), PacketSendError> {
+        self.send_packet_with_confirmation(
+            packet,
+            None,
+            None,
+            Some(identity),
+            Some(self.physics_reanchor.subscribe()),
+        )
     }
 
     pub fn send_chat_packet(
@@ -192,6 +246,8 @@ impl NetworkHandle {
                 sequence,
                 fast_transfer_action,
             }),
+            None,
+            None,
         )
     }
 
@@ -210,6 +266,8 @@ impl NetworkHandle {
                 count,
             }),
             None,
+            None,
+            None,
         )
     }
 
@@ -218,12 +276,16 @@ impl NetworkHandle {
         packet: Packet,
         sub_chunk: Option<SubChunkRequestSend>,
         chat: Option<ChatPacketSend>,
+        physics: Option<PhysicsSendIdentity>,
+        physics_reanchor: Option<watch::Receiver<u64>>,
     ) -> Result<(), PacketSendError> {
         self.commands
             .try_send(NetworkCommand::Send {
                 packet,
                 sub_chunk,
                 chat,
+                physics,
+                physics_reanchor,
             })
             .map_err(|error| match error {
                 mpsc::error::TrySendError::Full(NetworkCommand::Send { packet, .. }) => {
@@ -270,6 +332,7 @@ pub fn spawn_network(config: NetworkConfig) -> Result<NetworkHandle, std::io::Er
     let (control_event_tx, control_events) = mpsc::channel(CONTROL_EVENT_CAPACITY);
     let (world_event_tx, world_events) = mpsc::channel(WORLD_EVENT_CAPACITY);
     let (commands, command_rx) = mpsc::channel(COMMAND_CAPACITY);
+    let (physics_reanchor, _physics_reanchor_rx) = watch::channel(0);
     let (shutdown, mut shutdown_rx) = watch::channel(false);
     let thread = thread::Builder::new()
         .name("bedrock-network".to_owned())
@@ -355,6 +418,7 @@ pub fn spawn_network(config: NetworkConfig) -> Result<NetworkHandle, std::io::Er
         control_events,
         world_events,
         commands,
+        physics_reanchor,
         shutdown,
         thread: Some(thread),
     })
@@ -391,7 +455,7 @@ trait NetworkSession: Send {
 
     fn cancel_packet_id_trace(&mut self) {}
 
-    fn rotate_blob_cache_pending_for_fast_transfer(&mut self) {}
+    fn arm_blob_cache_reset_for_fast_transfer(&mut self) {}
 
     fn drain_packet_id_trace(&mut self) -> Option<PacketIdTraceSnapshot> {
         None
@@ -435,8 +499,8 @@ impl NetworkSession for protocol::PlaySession {
         protocol::PlaySession::cancel_packet_id_trace(self);
     }
 
-    fn rotate_blob_cache_pending_for_fast_transfer(&mut self) {
-        protocol::PlaySession::rotate_blob_cache_pending_for_fast_transfer(self);
+    fn arm_blob_cache_reset_for_fast_transfer(&mut self) {
+        protocol::PlaySession::arm_blob_cache_reset_for_fast_transfer(self);
     }
 
     fn drain_packet_id_trace(&mut self) -> Option<PacketIdTraceSnapshot> {
@@ -493,15 +557,50 @@ async fn run_network_pump<S: NetworkSession>(
                     packet,
                     sub_chunk,
                     chat,
+                    physics,
+                    mut physics_reanchor,
                 }) => {
+                    if let (Some(identity), Some(reanchor)) = (physics, physics_reanchor.as_ref())
+                        && *reanchor.borrow() != identity.reanchor_epoch
+                    {
+                        if !send_control_event_or_cancel(
+                            &control_event_tx,
+                            &mut shutdown_rx,
+                            NetworkControlEvent::PhysicsPacketCancelled {
+                                identity,
+                                definitely_unsent: true,
+                            },
+                        )
+                        .await
+                        {
+                            return;
+                        }
+                        continue;
+                    }
                     let trace_armed = chat.is_some_and(|chat| chat.fast_transfer_action.is_some());
                     if trace_armed {
                         session.begin_packet_id_trace();
                     }
-                    match wait_for_send_or_cancel(session.send_packet(packet), &mut shutdown_rx)
-                        .await
+                    let send_outcome = if let (Some(identity), Some(reanchor)) =
+                        (physics, physics_reanchor.as_mut())
                     {
-                        None => {
+                        wait_for_physics_send_or_cancel(
+                            session.send_packet(packet),
+                            &mut shutdown_rx,
+                            reanchor,
+                            identity.reanchor_epoch,
+                        )
+                        .await
+                    } else {
+                        match wait_for_send_or_cancel(session.send_packet(packet), &mut shutdown_rx)
+                            .await
+                        {
+                            Some(result) => PhysicsSendOutcome::Sent(result),
+                            None => PhysicsSendOutcome::Shutdown,
+                        }
+                    };
+                    match send_outcome {
+                        PhysicsSendOutcome::Shutdown => {
                             if trace_armed {
                                 session.cancel_packet_id_trace();
                             }
@@ -509,9 +608,37 @@ async fn run_network_pump<S: NetworkSession>(
                                 break;
                             }
                         }
-                        Some(Ok(())) => {
+                        PhysicsSendOutcome::Invalidated => {
                             if trace_armed {
-                                session.rotate_blob_cache_pending_for_fast_transfer();
+                                session.cancel_packet_id_trace();
+                            }
+                            if let Some(identity) = physics
+                                && !send_control_event_or_cancel(
+                                    &control_event_tx,
+                                    &mut shutdown_rx,
+                                    NetworkControlEvent::PhysicsPacketCancelled {
+                                        identity,
+                                        definitely_unsent: false,
+                                    },
+                                )
+                                .await
+                            {
+                                return;
+                            }
+                        }
+                        PhysicsSendOutcome::Sent(Ok(())) => {
+                            if trace_armed {
+                                session.arm_blob_cache_reset_for_fast_transfer();
+                            }
+                            if let Some(identity) = physics
+                                && !send_control_event_or_cancel(
+                                    &control_event_tx,
+                                    &mut shutdown_rx,
+                                    NetworkControlEvent::PhysicsPacketSent { identity },
+                                )
+                                .await
+                            {
+                                return;
                             }
                             if let Some(marker) = chat.and_then(|chat| {
                                 chat.fast_transfer_action.map(|action| {
@@ -577,7 +704,7 @@ async fn run_network_pump<S: NetworkSession>(
                                 return;
                             }
                         }
-                        Some(Err(error)) => {
+                        PhysicsSendOutcome::Sent(Err(error)) => {
                             if trace_armed {
                                 session.cancel_packet_id_trace();
                             }
@@ -593,6 +720,11 @@ async fn run_network_pump<S: NetworkSession>(
                                 )
                                 .await;
                             }
+                            emit_network_pump_terminal_marker(
+                                "send",
+                                &error.to_string(),
+                                session.decode_error_count(),
+                            );
                             send_final_blob_cache_telemetry(&session, &control_event_tx).await;
                             let _ = send_control_event_or_cancel(
                                 &control_event_tx,
@@ -627,6 +759,11 @@ async fn run_network_pump<S: NetworkSession>(
                 pending_world_event = Some(sequencer.wrap(*event));
             }
             NetworkPumpWork::Inbound(WorldSideWork::Event(Err(error))) => {
+                emit_network_pump_terminal_marker(
+                    "receive",
+                    &error.to_string(),
+                    session.decode_error_count(),
+                );
                 send_final_blob_cache_telemetry(&session, &control_event_tx).await;
                 let _ = send_control_event_or_cancel(
                     &control_event_tx,
@@ -672,6 +809,7 @@ fn try_emit_blob_cache_telemetry<S: NetworkSession>(
         })
         .is_ok()
     {
+        emit_bounded_blob_cache_warning(last_stats.unwrap_or_default(), stats);
         emit_blob_cache_telemetry(stats);
         *last_stats = Some(stats);
     }
@@ -711,10 +849,78 @@ fn emit_blob_cache_telemetry(stats: BlobCacheStats) {
         pending_transactions = stats.pending_transactions,
         pending_bytes = stats.pending_bytes,
         pending_resets = stats.pending_resets,
+        skipped_packets = stats.skipped_packets,
+        skipped_world_events = stats.skipped_world_events,
+        skipped_cached_packets = stats.skipped_cached_packets,
+        skipped_miss_responses = stats.skipped_miss_responses,
+        empty_miss_responses = stats.empty_miss_responses,
+        cached_packet_semantic_shape = stats.cached_packet_semantic_shape,
+        cached_packet_transaction_pressure = stats.cached_packet_transaction_pressure,
+        cached_packet_pending_pressure = stats.cached_packet_pending_pressure,
+        cached_packet_staged_pressure = stats.cached_packet_staged_pressure,
+        cached_packet_reconstruction_pressure = stats.cached_packet_reconstruction_pressure,
+        cached_packet_ready_pressure = stats.cached_packet_ready_pressure,
+        miss_response_unsolicited = stats.miss_response_unsolicited,
+        miss_response_integrity_rejection = stats.miss_response_integrity_rejection,
+        miss_response_cache_pressure = stats.miss_response_cache_pressure,
         reconstructed_level_chunks = stats.reconstructed_level_chunks,
         reconstructed_sub_chunks = stats.reconstructed_sub_chunks,
         "client blob cache counters"
     );
+}
+
+fn emit_bounded_blob_cache_warning(previous: BlobCacheStats, current: BlobCacheStats) {
+    let cached_packet_due = bounded_counter_log_due(
+        previous.skipped_cached_packets,
+        current.skipped_cached_packets,
+    );
+    let miss_response_due = bounded_counter_log_due(
+        previous.skipped_miss_responses,
+        current.skipped_miss_responses,
+    );
+    if cached_packet_due || miss_response_due {
+        bevy::log::warn!(
+            target: "bedrock_client::blob_cache",
+            skipped_cached_packets = current.skipped_cached_packets,
+            skipped_miss_responses = current.skipped_miss_responses,
+            cached_packet_semantic_shape = current.cached_packet_semantic_shape,
+            cached_packet_transaction_pressure = current.cached_packet_transaction_pressure,
+            cached_packet_pending_pressure = current.cached_packet_pending_pressure,
+            cached_packet_staged_pressure = current.cached_packet_staged_pressure,
+            cached_packet_reconstruction_pressure = current.cached_packet_reconstruction_pressure,
+            cached_packet_ready_pressure = current.cached_packet_ready_pressure,
+            miss_response_unsolicited = current.miss_response_unsolicited,
+            miss_response_integrity_rejection = current.miss_response_integrity_rejection,
+            miss_response_cache_pressure = current.miss_response_cache_pressure,
+            "skipped semantically invalid client blob-cache packet"
+        );
+    }
+}
+
+fn bounded_counter_log_due(previous: u64, current: u64) -> bool {
+    current != 0 && current > previous && (previous == 0 || current.ilog2() > previous.ilog2())
+}
+
+fn emit_network_pump_terminal_marker(stage: &'static str, message: &str, decode_errors: u64) {
+    let mut stdout = std::io::stdout().lock();
+    write_network_pump_terminal_marker(&mut stdout, stage, message, decode_errors);
+    let _ = stdout.flush();
+}
+
+fn write_network_pump_terminal_marker(
+    writer: &mut impl Write,
+    stage: &'static str,
+    message: &str,
+    decode_errors: u64,
+) {
+    let marker = serde_json::json!({
+        "schema": "rust-mcbe-network-pump-terminal-v1",
+        "outcome": "failed",
+        "stage": stage,
+        "message": message,
+        "decode_error_count": decode_errors,
+    });
+    let _ = writeln!(writer, "{NETWORK_PUMP_TERMINAL_MARKER}={marker}");
 }
 
 fn emit_packet_id_trace<S: NetworkSession>(session: &mut S) {
@@ -736,219 +942,8 @@ fn emit_packet_id_trace<S: NetworkSession>(session: &mut S) {
     );
 }
 
-enum WorldSideWork<'a, E> {
-    Event(Result<Box<WorldEvent>, E>),
-    Capacity(Result<mpsc::Permit<'a, WorldIngress>, mpsc::error::SendError<()>>),
-}
-
-async fn wait_for_world_side_work<'a, S: NetworkSession>(
-    session: &mut S,
-    current_dimension: i32,
-    world_event_tx: &'a mpsc::Sender<WorldIngress>,
-    has_pending_world_event: bool,
-) -> WorldSideWork<'a, S::Error> {
-    if has_pending_world_event {
-        WorldSideWork::Capacity(world_event_tx.reserve().await)
-    } else {
-        WorldSideWork::Event(
-            session
-                .receive_world_event(current_dimension)
-                .await
-                .map(Box::new),
-        )
-    }
-}
-
-async fn wait_for_shutdown(shutdown: &mut watch::Receiver<bool>) {
-    while !*shutdown.borrow() {
-        if shutdown.changed().await.is_err() {
-            break;
-        }
-    }
-}
-
-async fn wait_for_login_or_cancel<F>(
-    login: F,
-    shutdown: &mut watch::Receiver<bool>,
-) -> Option<F::Output>
-where
-    F: Future,
-{
-    if *shutdown.borrow() {
-        return None;
-    }
-    tokio::select! {
-        biased;
-        _ = wait_for_shutdown(shutdown) => None,
-        result = login => Some(result),
-    }
-}
-
-async fn wait_for_send_or_cancel<F>(
-    send: F,
-    shutdown: &mut watch::Receiver<bool>,
-) -> Option<F::Output>
-where
-    F: Future,
-{
-    if *shutdown.borrow() {
-        return None;
-    }
-    tokio::select! {
-        biased;
-        _ = wait_for_shutdown(shutdown) => None,
-        result = send => Some(result),
-    }
-}
-
-enum NetworkPumpWork<I, C> {
-    Shutdown,
-    Inbound(I),
-    Command(C),
-}
-
-#[derive(Clone, Copy)]
-enum NetworkPumpPreference {
-    Inbound,
-    Command,
-}
-
-async fn wait_for_network_work_or_cancel<I, C>(
-    inbound: I,
-    command: C,
-    shutdown: &mut watch::Receiver<bool>,
-    preference: &mut NetworkPumpPreference,
-) -> NetworkPumpWork<I::Output, C::Output>
-where
-    I: Future,
-    C: Future,
-{
-    if *shutdown.borrow() {
-        return NetworkPumpWork::Shutdown;
-    }
-    let work = match preference {
-        NetworkPumpPreference::Inbound => tokio::select! {
-            biased;
-            _ = wait_for_shutdown(shutdown) => NetworkPumpWork::Shutdown,
-            inbound = inbound => NetworkPumpWork::Inbound(inbound),
-            command = command => NetworkPumpWork::Command(command),
-        },
-        NetworkPumpPreference::Command => tokio::select! {
-            biased;
-            _ = wait_for_shutdown(shutdown) => NetworkPumpWork::Shutdown,
-            command = command => NetworkPumpWork::Command(command),
-            inbound = inbound => NetworkPumpWork::Inbound(inbound),
-        },
-    };
-    match &work {
-        NetworkPumpWork::Shutdown => {}
-        NetworkPumpWork::Inbound(_) => *preference = NetworkPumpPreference::Command,
-        NetworkPumpWork::Command(_) => *preference = NetworkPumpPreference::Inbound,
-    }
-    work
-}
-
-async fn send_control_event_or_cancel(
-    events: &mpsc::Sender<NetworkControlEvent>,
-    shutdown: &mut watch::Receiver<bool>,
-    event: NetworkControlEvent,
-) -> bool {
-    send_event_or_cancel(events, shutdown, event).await
-}
-
-#[cfg(test)]
-async fn send_world_event_or_cancel(
-    events: &mpsc::Sender<WorldIngress>,
-    shutdown: &mut watch::Receiver<bool>,
-    event: SequencedWorldEvent,
-) -> bool {
-    send_event_or_cancel(events, shutdown, WorldIngress::Event(event)).await
-}
-
-async fn send_event_or_cancel<T>(
-    events: &mpsc::Sender<T>,
-    shutdown: &mut watch::Receiver<bool>,
-    event: T,
-) -> bool {
-    if *shutdown.borrow() {
-        return false;
-    }
-    tokio::select! {
-        biased;
-        _ = wait_for_shutdown(shutdown) => false,
-        result = events.send(event) => result.is_ok(),
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-struct NetworkSequencer {
-    session_generation: u64,
-    next_sequence: u64,
-    current_dimension: i32,
-    local_player_runtime_id: u64,
-}
-
-impl NetworkSequencer {
-    const fn new(
-        session_generation: u64,
-        current_dimension: i32,
-        local_player_runtime_id: u64,
-    ) -> Self {
-        Self {
-            session_generation,
-            next_sequence: 1,
-            current_dimension,
-            local_player_runtime_id,
-        }
-    }
-
-    fn wrap_fast_transfer_barrier(&mut self, action_sequence: u64) -> WorldIngress {
-        let sequence = self.next_sequence;
-        self.next_sequence = self.next_sequence.saturating_add(1);
-        WorldIngress::FastTransferBarrier {
-            session_generation: self.session_generation,
-            sequence,
-            action_sequence,
-        }
-    }
-
-    const fn current_dimension(self) -> i32 {
-        self.current_dimension
-    }
-
-    fn wrap(&mut self, event: WorldEvent) -> SequencedWorldEvent {
-        let event = match event {
-            WorldEvent::MovePlayer(movement)
-                if movement.runtime_id != self.local_player_runtime_id =>
-            {
-                WorldEvent::Actor(protocol::ActorEvent::Move(protocol::ActorMoveEvent {
-                    dimension: self.current_dimension,
-                    runtime_id: movement.runtime_id,
-                    position: movement.position.map(Some),
-                    position_origin: protocol::ActorPositionOrigin::NetworkOffset,
-                    pitch: Some(movement.pitch),
-                    yaw: Some(movement.yaw),
-                    head_yaw: Some(movement.head_yaw),
-                    on_ground: Some(movement.on_ground),
-                    teleported: movement.teleported,
-                    player_mode: Some(movement.mode),
-                    source_tick: Some(movement.source_tick),
-                }))
-            }
-            event => event,
-        };
-        let sequence = self.next_sequence;
-        self.next_sequence = self.next_sequence.saturating_add(1);
-        if let WorldEvent::ChangeDimension(change) = &event {
-            self.current_dimension = change.dimension;
-        }
-        SequencedWorldEvent {
-            session_generation: self.session_generation,
-            sequence,
-            event,
-        }
-    }
-}
+mod pump;
+use pump::*;
 
 #[cfg(test)]
 mod tests;

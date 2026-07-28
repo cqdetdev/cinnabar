@@ -99,7 +99,7 @@ Phase status at this audit:
 | Phase 2.5 biome blending | Open: the provisional 3x3 blend kernel still needs an abrupt native biome-boundary comparison and live acceptance |
 | Phase 2.6 visual coverage | Open: the authoritative production residual is 2,398 diagnostics; the leaf-litter tranche above is not counted because it is review-blocked and unmerged |
 | Phase 2.7 lighting/sky/fog/clouds | Open: the cloud evidence sub-gate is complete, but calibrated atmosphere parity, native cloud/celestial comparison, and the <=2 s teleport-remesh gate remain open |
-| Phase 3 movement | Packet/simulation foundations plus app input, fixed-step simulation, collision registries, camera interpolation, and correction/session reanchors are integrated through `e370880`. Production outbound movement remains intentionally off in FreeCamera mode; remaining bedsim movement strata and live server-authoritative acceptance are still open |
+| Phase 3 movement | Packet/simulation foundations plus the reviewed PR #6 input-parity and correction/acceptance lanes are integrated through merge `a9593e7`. Implementation and deterministic verification are complete, but native/live, performance, and touch-parity acceptance remain open. By owner decision touch is deprioritized and does not gate Phase 3 acceptance; the scenario records it as deferred rather than satisfied. Production outbound `Physics` transmission remains intentionally disabled pending a separate reviewed change |
 | Phase 4 actors | Actor tracking, standard-skin biped rendering, Oomph-style three-tick player convergence, distinct per-frame render interpolation, and the bounded MCBEENT3 geometry/bone/cube carrier are complete. Runtime rig consumption, animations/Molang, persona/custom rendering, legacy/outer skin layers, and remaining entity families are still open |
 
 Nine other patch-unique branch heads were audited as superseded/reimplemented and were
@@ -1653,7 +1653,98 @@ tick states; correction/rewind handling (`CorrectPlayerMovePrediction`).
   production remains `FreeCamera` and sends no local position updates. Enabling `Physics`
   authority requires the remaining movement strata plus live server-authoritative verification.
 
+- **PR #6 Phase 3 integration record (2026-07-26).** Both independently reviewed lanes landed
+  with history preserved. The input-parity lane `codex/pr6-input-parity` was approved at
+  `c1bb584` after five independent Sol-high review rounds and four fix rounds, with final
+  decision `APPROVE` and no findings, then landed as merge `cfdf897`. The correction and
+  acceptance lane `agent/pr6-phase3-completion` was approved at `e099529` after six independent
+  Sol-high review rounds and five fix rounds, with final decision `APPROVE` and no findings,
+  then landed as merge `a9593e7`.
+  - Post-integration deterministic verification on the merged tree passed:
+    `cargo test -p semantic-input --locked` (53 passed);
+    `cargo test -p bedrock-client --locked` (lib 420, assets 41, hud_assets 9,
+    inventory_router 3, physics_assets 2, doctest 1; all passed);
+    `cargo test -p protocol --locked` (21 test binaries, all passed);
+    `cargo test -p client-world --locked` (lib 236 passed / 1 ignored,
+    entity_runtime 11, item_actions 14; all passed);
+    `cargo fmt --all -- --check` passed;
+    `git diff --check` passed;
+    `cargo clippy --workspace --all-targets --locked -- -D warnings` passed with zero
+    warnings and is CI's exact Clippy command; and
+    `Invoke-Pester -Script 'scripts/tests/acceptance/Phase3.Tests.ps1' -PassThru` passed
+    89/89.
+  - `cargo test --workspace --locked` was not run locally as a single invocation. The
+    per-crate suites above were run instead; CI runs the workspace form.
+  - Implementation and deterministic verification are complete. Native/live and performance
+    acceptance remain open and are **not** closed; Phase 3 is not complete. No native/live
+    acceptance checkbox is closed by this integration.
+  - Production outbound `Physics` transmission remains intentionally disabled. Enabling it is
+    a separate reviewed change.
+  - The network lifecycle emits one bootstrap per `NetworkHandle`; same-handle session
+    replacement remains a known uncovered lifecycle.
+  - Follow-up harness correction: by owner decision touch parity is deprioritized and does
+    not gate Phase 3 acceptance. `CandidatePhysics` requires keyboard/mouse and gamepad
+    witnesses, while its manifest and final evidence name Touch as `Deferred`, attribute the
+    deferral to the owner decision, and leave touch parity open rather than treating it as
+    observed or satisfied.
+  - `Phase3Launcher.ps1` now supports authenticated `Zeno` runs at
+    `zenomc.org:19197`, following the same candidate/free-camera scenario and five-minute
+    minimum used by the other external targets. Zeno is the low-population official-BDS
+    server-authority target for movement rejection and correction checks.
+  - Pre-existing, out-of-scope observation: adding `--all-features` to Clippy fails in the
+    vendored `crates/protocol/vendor/jolyne` crate because optional dependencies are not
+    vendored. This work did not cause that failure, and CI does not use `--all-features`.
+
+- **Phase 3 local BDS smoke findings (2026-07-26, four runs at BDS 1.26.32.2).**
+  These runs found defects; they did not validate native parity, remote-server behavior, or
+  Phase 3 acceptance and do not advance Phase 3 closure. Phase 3 remains incomplete; native/live
+  and performance acceptance remain open.
+  - Fixed and confirmed only against local BDS 1.26.32.2: blob-cache admission exhaustion at
+    the former 256-transaction cap was fatal and is now recoverable, improving session survival
+    from 9.1 seconds to 114–187 seconds. Zero-blob cache-miss responses were incorrectly treated
+    as invalid, causing arbitrary FIFO retirement and a feedback loop; they are now successful
+    no-ops, with live runs reporting `skipped_miss_responses = 0`,
+    `retired_cached_transactions = 0`, and 283 / 4,666 empty responses handled cleanly.
+    Skip telemetry is now separated by reason and resync lifecycle counters exist; this
+    observability isolated the remaining defect in one run. Before the loop fix, measured join
+    high-water marks were 1,194 / 845 pending transactions, independently showing that the old
+    256 cap was under-calibrated.
+  - Open, root-caused, and not fixed: blob-cache FIFO head-of-line blocking in
+    `crates/protocol/src/blob_cache/resolver.rs`. Cached chunks, ordinary packets, and world
+    events share one `pending + ready` budget (`resolver.rs:153`, `:249-254`, `:287-292`,
+    `:454-459`), while draining requires the front transaction to have every hash cached
+    (`:811-817`). One unresolved cached transaction therefore blocks hash-free world events and
+    all later work. At capacity cached packets are skipped (`:387-392`), and world events are
+    silently and permanently discarded without stored retry or resync (`:271-275`).
+  - Live evidence at `b29966d`: pending transactions pinned at 2,047/2,048 in both scenarios;
+    `skipped_world_events` was 9,139 / 15,002 and cached transaction-pressure skips were
+    2,312 / 3,953. Byte-pressure, semantic-shape, unsolicited, and integrity skips were all
+    zero, as were all resync lifecycle counters.
+  - Pressure-skipped `SubChunk` packets receive no resync because
+    `queue_level_chunk_resync` returns `None` for non-`LevelChunk` packets
+    (`resolver/helpers.rs:35-40`). They fall back to two client-world retries
+    (`stream.rs:101-102`), then finish with `collision_authoritative = false`
+    (`stream/retries.rs:247-255`) while the column is still added to `loaded_columns`
+    (`retries.rs:39-47`), so cohort completeness can be misleading. Consequently
+    `mutation_coordinate` remains `null` (`app-metrics.json:7`);
+    `RUST_MCBE_WORLD_READY` never fires (`app/src/acceptance/mutation.rs:270-272`), the
+    60-second acceptance clock never arms, and runs hang until the launcher's 180-second bound.
+    **No `phase3-final.json` has ever been produced; there is no Phase 3 acceptance verdict of
+    any kind.**
+  - Open separate defect: the local Go bridge reported
+    `invalid checksum of packet 6217`, then the local listener was forcibly closed
+    (OS error 10054). Saturation is neither its cause nor consequence: FreeCamera saturated
+    well before it, while CandidatePhysics saturated more severely without a checksum error.
+    Likely investigation targets are cipher-counter divergence, send-buffer reuse, or frame
+    corruption in the Rust-to-Go bridge; this needs a separate instrumented investigation.
+  - Open and unchanged: every CandidatePhysics run still reports `physics_tick_overflow` with
+    `detail.dropped = 5` and an authority-fault violation. The prior diagnosis is that
+    "collision data unavailable, wait" and "cannot keep up, dropped time" are conflated in
+    `dropped_ticks`, and any nonzero value revokes authority. This is not fixed.
+
 - [ ] **3.4 Semantic controls and camera perspectives.** `P3.4-INPUT-CAMERA`
+  Touch parity remains an explicit open closure item. Its owner-deprioritized witness does
+  not gate the Phase 3 scenario verdict, and a passing candidate run does not close touch.
 
 ## Phase 4 — Entities and other players
 
