@@ -11,7 +11,7 @@ use assets::{RuntimeAssets, RuntimeEntityAssets};
 use bevy::{
     app::AppExit,
     ecs::system::SystemParam,
-    log::{debug, info},
+    log::{debug, info, warn},
     prelude::{MessageReader, Query, Res, ResMut, Resource, Time, Transform, Vec3, With},
     time::Real,
 };
@@ -51,7 +51,10 @@ use crate::{
         telemetry::bedrock_camera_rotation,
         visibility::{AppMetrics, DiagnosticQuads},
     },
-    ui_runtime::{SequencedBlockCrackEvent, SequencedLocalAttributes, SequencedUiEvent, UiRuntime},
+    ui_runtime::{
+        BlockCrackRetainOutcome, SequencedBlockCrackEvent, SequencedLocalAttributes,
+        SequencedUiEvent, UiRuntime,
+    },
 };
 
 pub(crate) const SHUTDOWN_WATCHDOG_TIMEOUT: Duration = Duration::from_secs(2);
@@ -591,12 +594,24 @@ pub(crate) fn drive_world_stream(
                 sequence,
                 dimension,
                 event,
-            } => ui_runtime.retain_block_crack(SequencedBlockCrackEvent {
-                session_id: clock.session_generation(),
-                fifo_sequence: sequence,
-                dimension,
-                event,
-            }),
+            } => ui_runtime
+                .retain_block_crack(SequencedBlockCrackEvent {
+                    session_id: clock.session_generation(),
+                    fifo_sequence: sequence,
+                    dimension,
+                    event,
+                })
+                .map(|outcome| {
+                    if let BlockCrackRetainOutcome::SkippedQueueFull { skipped_total } = outcome
+                        && skipped_total.is_power_of_two()
+                    {
+                        warn!(
+                            skipped_total,
+                            maximum = crate::ui_runtime::MAX_PENDING_BLOCK_CRACK_EVENTS,
+                            "skipping remote block-crack event because the handoff queue is full"
+                        );
+                    }
+                }),
             CommittedUiEvent::LocalAttributes {
                 sequence,
                 server_tick,

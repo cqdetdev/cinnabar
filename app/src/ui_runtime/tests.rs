@@ -548,11 +548,25 @@ fn block_crack_handoff_is_bounded_without_dropping_existing_events() {
                 action: BlockCrackAction::Stop,
             },
         }),
-        Err(UiRuntimeError::BlockCrackQueueFull {
-            maximum: MAX_PENDING_BLOCK_CRACK_EVENTS,
-        })
+        Ok(BlockCrackRetainOutcome::SkippedQueueFull { skipped_total: 1 })
     );
     assert_eq!(runtime.pending_block_cracks(), &before);
+    assert_eq!(runtime.skipped_block_crack_events(), 1);
+
+    assert_eq!(
+        runtime.retain_block_crack(SequencedBlockCrackEvent {
+            session_id: 9,
+            fifo_sequence: MAX_PENDING_BLOCK_CRACK_EVENTS as u64 + 1,
+            dimension: 1,
+            event: BlockCrackEvent {
+                position: [1, 0, 0],
+                action: BlockCrackAction::Stop,
+            },
+        }),
+        Ok(BlockCrackRetainOutcome::SkippedQueueFull { skipped_total: 2 })
+    );
+    assert_eq!(runtime.pending_block_cracks(), &before);
+    assert_eq!(runtime.skipped_block_crack_events(), 2);
 }
 
 #[test]

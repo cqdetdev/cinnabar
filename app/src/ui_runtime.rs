@@ -119,11 +119,16 @@ pub enum UiApplyOutcome {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BlockCrackRetainOutcome {
+    Retained,
+    SkippedQueueFull { skipped_total: u64 },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum UiRuntimeError {
     WrongSession { expected: u64, actual: u64 },
     StaleFifoSequence { previous: u64, actual: u64 },
     StaleBlockCrackSequence { previous: u64, actual: u64 },
-    BlockCrackQueueFull { maximum: usize },
     InventoryQueueFull { maximum: usize },
     NonMonotonicLocalTime { previous: u64, actual: u64 },
     NonMonotonicServerTick { previous: u64, actual: u64 },
@@ -176,6 +181,7 @@ pub struct UiRuntime {
     chat_xuid: Arc<str>,
     dropped_unsent_chat_messages: u64,
     pending_block_cracks: VecDeque<SequencedBlockCrackEvent>,
+    skipped_block_crack_events: u64,
     inventory_authority: Option<InventoryAuthority>,
     player_game_mode: Option<PlayerGameMode>,
     last_inventory_sequence: Option<u64>,
@@ -215,6 +221,7 @@ impl UiRuntime {
             chat_xuid: Arc::from(""),
             dropped_unsent_chat_messages: 0,
             pending_block_cracks: VecDeque::with_capacity(MAX_PENDING_BLOCK_CRACK_EVENTS),
+            skipped_block_crack_events: 0,
             inventory_authority: None,
             player_game_mode: None,
             last_inventory_sequence: None,
@@ -587,6 +594,10 @@ impl UiRuntime {
         self.pending_block_cracks.drain(..).collect()
     }
 
+    pub const fn skipped_block_crack_events(&self) -> u64 {
+        self.skipped_block_crack_events
+    }
+
     pub fn begin_session(&mut self, session_id: u64) {
         if self.session_id == session_id {
             return;
@@ -746,7 +757,7 @@ impl UiRuntime {
     pub fn retain_block_crack(
         &mut self,
         envelope: SequencedBlockCrackEvent,
-    ) -> Result<(), UiRuntimeError> {
+    ) -> Result<BlockCrackRetainOutcome, UiRuntimeError> {
         if envelope.session_id != self.session_id {
             return Err(UiRuntimeError::WrongSession {
                 expected: self.session_id,
@@ -762,13 +773,15 @@ impl UiRuntime {
             });
         }
         if self.pending_block_cracks.len() >= MAX_PENDING_BLOCK_CRACK_EVENTS {
-            return Err(UiRuntimeError::BlockCrackQueueFull {
-                maximum: MAX_PENDING_BLOCK_CRACK_EVENTS,
+            self.last_block_crack_sequence = Some(envelope.fifo_sequence);
+            self.skipped_block_crack_events = self.skipped_block_crack_events.saturating_add(1);
+            return Ok(BlockCrackRetainOutcome::SkippedQueueFull {
+                skipped_total: self.skipped_block_crack_events,
             });
         }
         self.last_block_crack_sequence = Some(envelope.fifo_sequence);
         self.pending_block_cracks.push_back(envelope);
-        Ok(())
+        Ok(BlockCrackRetainOutcome::Retained)
     }
 
     pub fn apply_local_attributes(
