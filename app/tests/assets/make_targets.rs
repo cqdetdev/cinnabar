@@ -404,8 +404,12 @@ fn make_client_acquires_compiles_all_assets_then_launches() {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
+    let observed_order = fs::read_to_string(&log).unwrap();
     assert_eq!(
-        fs::read_to_string(&log).unwrap().lines().collect::<Vec<_>>(),
+        observed_order
+            .lines()
+            .map(str::trim_end)
+            .collect::<Vec<_>>(),
         ["acquire", "world", "atmosphere", "entity", "font", "hud", "physics", "launch"]
     );
 
