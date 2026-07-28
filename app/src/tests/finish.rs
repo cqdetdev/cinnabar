@@ -632,6 +632,15 @@ fn world_ready_requires_a_stable_quiet_interval_and_resets_when_work_reappears()
 }
 
 #[test]
+fn world_ready_diagnostics_are_immediate_then_bounded_to_ten_seconds() {
+    let started = Instant::now();
+    let mut settler = WorldReadySettler::default();
+    assert!(settler.should_emit_diagnostic(started));
+    assert!(!settler.should_emit_diagnostic(started + Duration::from_secs(9)));
+    assert!(settler.should_emit_diagnostic(started + WORLD_READY_DIAGNOSTIC_INTERVAL));
+}
+
+#[test]
 fn mutation_tracker_closes_latency_only_on_the_target_gpu_acknowledgement() {
     let coordinate = [14, 71, -6];
     let observed_at = Instant::now();

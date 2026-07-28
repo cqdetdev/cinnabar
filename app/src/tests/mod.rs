@@ -49,9 +49,9 @@ use crate::acceptance::{
         teleport_global_stage_diagnostic_marker,
     },
     world_ready::{
-        GalleryAnchorEmitter, SubChunkTimeoutProgress, WORLD_READY_QUIET_INTERVAL,
-        WorldReadySettler, WorldReadySnapshot, WorldReadyWork, mutation_look_target,
-        orient_mutation_camera,
+        GalleryAnchorEmitter, SubChunkTimeoutProgress, WORLD_READY_DIAGNOSTIC_INTERVAL,
+        WORLD_READY_QUIET_INTERVAL, WorldReadySettler, WorldReadySnapshot, WorldReadyWork,
+        mutation_look_target, orient_mutation_camera,
     },
 };
 use crate::metrics::{DiagnosticQuadTracker, MetricsCollector, TransparentSortMetricsSnapshot};

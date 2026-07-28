@@ -1,7 +1,7 @@
 use std::{io::Write, time::Instant};
 
 use bevy::{
-    log::error,
+    log::{error, info},
     prelude::{Query, Res, ResMut, Transform, Vec3, With},
 };
 use client_world::ViewCohortStatus;
@@ -36,6 +36,8 @@ use crate::{
 
 pub(crate) const WORLD_READY_QUIET_INTERVAL: std::time::Duration =
     std::time::Duration::from_secs(2);
+pub(crate) const WORLD_READY_DIAGNOSTIC_INTERVAL: std::time::Duration =
+    std::time::Duration::from_secs(10);
 
 impl AcceptanceRun {
     pub(crate) fn revoke_world_ready_if_cohort_changed(
@@ -159,6 +161,7 @@ pub(crate) struct WorldReadySettler {
     pub(crate) candidate: Option<(WorldReadySnapshot, Instant)>,
     pub(crate) presentation: Option<WorldReadyPresentationCandidate>,
     pub(crate) next_view_generation: u64,
+    pub(crate) last_diagnostic_at: Option<Instant>,
 }
 
 #[derive(Debug, Clone)]
@@ -170,6 +173,16 @@ pub(crate) struct WorldReadyPresentationCandidate {
 }
 
 impl WorldReadySettler {
+    pub(crate) fn should_emit_diagnostic(&mut self, now: Instant) -> bool {
+        if self.last_diagnostic_at.is_some_and(|last| {
+            now.saturating_duration_since(last) < WORLD_READY_DIAGNOSTIC_INTERVAL
+        }) {
+            return false;
+        }
+        self.last_diagnostic_at = Some(now);
+        true
+    }
+
     pub(crate) fn reconcile_presentation(
         &mut self,
         snapshot: WorldReadySnapshot,
@@ -591,6 +604,25 @@ pub(crate) fn emit_world_ready(
         work,
     };
     let ready_at = Instant::now();
+    if acceptance
+        .world_ready_settler
+        .should_emit_diagnostic(ready_at)
+    {
+        info!(
+            mutation_coordinate = ?snapshot.mutation_coordinate,
+            received_radius_chunks = ?snapshot.received_radius_chunks,
+            publisher_radius_chunks = ?snapshot.publisher_radius_chunks,
+            cohort = ?snapshot.cohort,
+            rendered_sub_chunks = snapshot.rendered_sub_chunks,
+            resident_sub_chunks = snapshot.resident_sub_chunks,
+            visible_sub_chunks = snapshot.visible_sub_chunks,
+            mutation_target_rendered = snapshot.mutation_target_rendered,
+            mutation_target_visible = snapshot.mutation_target_visible,
+            mutation_target_clean = snapshot.mutation_target_clean,
+            work = ?snapshot.work,
+            "world readiness progress"
+        );
+    }
     let proposed = snapshot.cohort.and_then(|status| {
         render_queue.freeze_target_expectation_for_columns(
             render_view_cohort(status.target),
