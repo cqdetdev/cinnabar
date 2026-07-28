@@ -15,13 +15,14 @@ fn make_client_acquires_and_builds_the_required_physics_registry() {
         "BLOCK_DATA_DIR ?= .local/assets/block-data",
         "PHYSICS_REGISTRY ?= .local/assets/block-physics-v1001.bin",
         "PHYSICS_REGISTRY_SHA256 ?= crates/assets/data/block-physics-v1001.sha256",
+        "absolute_path = $(if $(findstring :/,$(1)),$(1),$(abspath $(1)))",
         "physics-assets: $(PHYSICS_REGISTRY)",
         "$(GO) -C tools/registrygen run ./cmd/datafetch",
-        "-manifest \"$(abspath $(BLOCK_DATA_MANIFEST))\"",
-        "-out \"$(abspath $(BLOCK_DATA_DIR))\"",
-        "-light-breg \"$(abspath $(BLOCK_REGISTRY))\"",
-        "-physics-out \"$(abspath $(PHYSICS_REGISTRY))\"",
-        "-physics-breg \"$(abspath $(BLOCK_REGISTRY))\"",
+        "-manifest \"$(call absolute_path,$(BLOCK_DATA_MANIFEST))\"",
+        "-out \"$(call absolute_path,$(BLOCK_DATA_DIR))\"",
+        "-light-breg \"$(call absolute_path,$(BLOCK_REGISTRY))\"",
+        "-physics-out \"$(call absolute_path,$(PHYSICS_REGISTRY))\"",
+        "-physics-breg \"$(call absolute_path,$(BLOCK_REGISTRY))\"",
         "$(GO) -C tools/registrygen run ./cmd/hashcheck",
         "$(PHYSICS_REGISTRY_CHECK) || ( $(PHYSICS_REGISTRY_COMPILE) && $(PHYSICS_REGISTRY_CHECK) )",
     ] {
@@ -88,11 +89,20 @@ fn make_physics_assets_repairs_a_newer_corrupt_registry_once() {
             .set_modified(old)
             .unwrap();
     }
-    let compile = format!(
-        "echo invocation >> \"{}\" && echo repaired > \"{}\"",
-        make_path(&invocation_log),
-        make_path(&physics)
-    );
+    let compile = if cfg!(windows) {
+        format!(
+            "powershell -NoProfile -Command \"[IO.File]::AppendAllText('{}', 'invocation`n'); \
+             [IO.File]::WriteAllBytes('{}', [byte[]](114,101,112,97,105,114,101,100,10))\"",
+            make_path(&invocation_log),
+            make_path(&physics)
+        )
+    } else {
+        format!(
+            "printf 'invocation\\n' >> \"{}\" && printf 'repaired\\n' > \"{}\"",
+            make_path(&invocation_log),
+            make_path(&physics)
+        )
+    };
     let assignments = [
         "REGISTRYGEN_INPUTS=".to_owned(),
         "BLOCK_DATA_FETCH_INPUTS=".to_owned(),
