@@ -587,6 +587,11 @@ fn surface_spawn_waits_for_level_chunk_commit_and_treats_omitted_top_as_air() {
         stream.surface_eye_position(block_x, block_z),
         Some([block_x as f32 + 0.5, -46.38, block_z as f32 + 0.5])
     );
+    assert_eq!(
+        stream.surface_eye_position_at_or_below(block_x, block_z, -55),
+        Some([block_x as f32 + 0.5, -52.38, block_z as f32 + 0.5]),
+        "the acceptance anchor must ignore non-air blocks above the authoritative player"
+    );
 }
 
 #[test]

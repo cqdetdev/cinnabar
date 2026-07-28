@@ -19,7 +19,7 @@ use client_world::{
     CommittedControlEvent, CommittedUiEvent, WorldMeshChange, WorldStream, WorldStreamPoll,
 };
 use meshing::CameraMedium;
-use protocol::BlobCacheStats;
+use protocol::{BlobCacheStats, PLAYER_NETWORK_OFFSET};
 use render::{
     ChunkBiomeTints, ChunkRenderQueue, ChunkUploadAcknowledgements, ChunkUploadBudget,
     ChunkUploadPriority, ChunkUploadToken,
@@ -62,6 +62,13 @@ pub(crate) const SHUTDOWN_WATCHDOG_TIMEOUT: Duration = Duration::from_secs(2);
 fn position_distance(from: [f32; 3], to: [f32; 3]) -> f32 {
     let delta = Vec3::from_array(to) - Vec3::from_array(from);
     delta.length()
+}
+
+pub(crate) fn acceptance_surface_maximum_y(network_position: [f32; 3]) -> Option<i32> {
+    let feet_y = network_position[1] - PLAYER_NETWORK_OFFSET;
+    feet_y
+        .is_finite()
+        .then(|| feet_y.floor().clamp(i32::MIN as f32, i32::MAX as f32) as i32)
 }
 
 #[derive(Resource, Debug, Default)]
@@ -641,8 +648,10 @@ pub(crate) fn drive_world_stream(
     });
     let resolved_mutation_coordinate = acceptance.mutation_surface_anchor().and_then(|anchor| {
         client_world.stream.as_ref().and_then(|stream| {
+            let maximum_block_y =
+                acceptance_surface_maximum_y(stream.resolved_server_position().position)?;
             stream
-                .surface_eye_position(anchor[0], anchor[1])
+                .surface_eye_position_at_or_below(anchor[0], anchor[1], maximum_block_y)
                 .map(|position| deterministic_mutation_coordinate(position, anchor))
         })
     });

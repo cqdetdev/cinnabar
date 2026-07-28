@@ -132,6 +132,14 @@ impl WorldStream {
         self.connectivity.get(&key).copied()
     }
     pub fn surface_eye_position(&self, block_x: i32, block_z: i32) -> Option<[f32; 3]> {
+        self.surface_eye_position_at_or_below(block_x, block_z, i32::MAX)
+    }
+    pub fn surface_eye_position_at_or_below(
+        &self,
+        block_x: i32,
+        block_z: i32,
+        maximum_block_y: i32,
+    ) -> Option<[f32; 3]> {
         let range = vanilla_dimension_range(self.current_dimension)?;
         let chunk = ChunkKey::new(
             self.current_dimension,
@@ -147,20 +155,25 @@ impl WorldStream {
         let local_x = block_x.rem_euclid(16) as u8;
         let local_z = block_z.rem_euclid(16) as u8;
         for key in keys.rev() {
+            let sub_chunk_min_y = key.y.saturating_mul(16);
+            if sub_chunk_min_y > maximum_block_y {
+                continue;
+            }
             if self.known_air.contains(&key) {
                 continue;
             }
             let Some(sub_chunk) = self.store.sub_chunk(key) else {
                 continue;
             };
-            for local_y in (0_u8..16).rev() {
+            let maximum_local_y = maximum_block_y.saturating_sub(sub_chunk_min_y).min(15) as u8;
+            for local_y in (0_u8..=maximum_local_y).rev() {
                 let solid = (0..sub_chunk.storages().len()).any(|layer| {
                     sub_chunk
                         .runtime_id(layer, local_x, local_y, local_z)
                         .is_some_and(|runtime_id| !self.classifier.is_air(runtime_id))
                 });
                 if solid {
-                    let block_y = key.y.saturating_mul(16) + i32::from(local_y);
+                    let block_y = sub_chunk_min_y.saturating_add(i32::from(local_y));
                     return Some([
                         block_x as f32 + 0.5,
                         block_y as f32 + 2.62,

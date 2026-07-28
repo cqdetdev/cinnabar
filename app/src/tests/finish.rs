@@ -300,6 +300,18 @@ fn remote_acceptance_anchors_the_mutation_to_the_live_player_not_world_spawn() {
 }
 
 #[test]
+fn remote_acceptance_surface_scan_cannot_select_blocks_above_the_live_player() {
+    assert_eq!(
+        acceptance_surface_maximum_y([-1350.0, 104.621, 1634.0]),
+        Some(103)
+    );
+    assert_eq!(
+        acceptance_surface_maximum_y([0.0, f32::INFINITY, 0.0]),
+        None
+    );
+}
+
+#[test]
 fn mutation_look_target_centers_the_block_before_world_ready_visibility_sampling() {
     assert_eq!(
         mutation_look_target(Some([14, 71, -6])),
