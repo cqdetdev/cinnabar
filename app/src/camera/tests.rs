@@ -567,6 +567,54 @@ fn plugin_spawns_camera_and_auto_fly_uses_delta_seconds() {
 }
 
 #[test]
+fn acceptance_auto_fly_waits_for_world_ready_before_changing_visibility() {
+    let mut app = App::new();
+    app.init_resource::<Time>()
+        .insert_resource(crate::acceptance::AcceptanceRun::new(
+            Some(60),
+            None,
+            false,
+            false,
+        ))
+        .add_plugins(FlyCameraPlugin::new(true));
+    app.world_mut().spawn((
+        Window {
+            focused: true,
+            ..default()
+        },
+        CursorOptions::default(),
+        PrimaryWindow,
+    ));
+
+    app.update();
+    let start = app.world().resource::<LocalViewPose>().eye_translation();
+    app.world_mut()
+        .resource_mut::<Time>()
+        .advance_by(Duration::from_secs_f32(0.5));
+    app.update();
+    assert_eq!(
+        app.world().resource::<LocalViewPose>().eye_translation(),
+        start,
+        "pre-ready acceptance motion keeps invalidating the exact presentation snapshot"
+    );
+
+    app.world_mut()
+        .resource_mut::<crate::acceptance::AcceptanceRun>()
+        .world_ready = true;
+    app.world_mut()
+        .resource_mut::<Time>()
+        .advance_by(Duration::from_secs_f32(0.5));
+    app.update();
+    let expected = start + camera::auto_fly_offset(0.5);
+    assert!(
+        app.world()
+            .resource::<LocalViewPose>()
+            .eye_translation()
+            .abs_diff_eq(expected, 1.0e-4)
+    );
+}
+
+#[test]
 fn horizontal_fov_converts_to_aspect_correct_vertical_fov() {
     let horizontal = 90.0_f32.to_radians();
     let sixteen_nine = camera::horizontal_fov_to_vertical(horizontal, 16.0 / 9.0);

@@ -603,11 +603,21 @@ fn update_movement(
     input: Res<SemanticInputSnapshot>,
     time: Res<Time>,
     mut auto_fly: ResMut<AutoFly>,
+    acceptance: Option<Res<crate::acceptance::AcceptanceRun>>,
     local_physics: Option<Res<crate::movement::LocalPhysicsController>>,
     camera: Single<&FlyCamera>,
     mut view: ResMut<LocalViewPose>,
 ) {
     if auto_fly.enabled() {
+        if acceptance
+            .as_deref()
+            .is_some_and(|run| run.enabled() && !run.world_ready)
+        {
+            auto_fly.path_anchor = None;
+            auto_fly.last_path_position = None;
+            auto_fly.elapsed_seconds = 0.0;
+            return;
+        }
         let externally_moved = auto_fly
             .last_path_position
             .is_some_and(|last| last.distance_squared(view.eye_translation()) > 0.01);
