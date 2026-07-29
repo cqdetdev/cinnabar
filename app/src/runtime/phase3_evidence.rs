@@ -168,7 +168,6 @@ pub(crate) struct Phase3EvidenceIdentitySource {
 impl Phase3EvidenceIdentitySource {
     pub(crate) fn from_build(
         target: Phase3Target,
-        candidate_physics: bool,
         collisions: &PhysicsCollisionRegistries,
     ) -> Result<Self, Phase3EvidenceIdentityError> {
         let build_commit = option_env!("RUST_MCBE_BUILD_COMMIT").ok_or(
@@ -182,7 +181,7 @@ impl Phase3EvidenceIdentitySource {
             1,
             collisions.preg_sha256(),
             collisions.breg_sha256(),
-            candidate_physics,
+            false,
         )?;
         validate_phase3_build_source(option_env!("RUST_MCBE_SOURCE_DIRTY"))?;
         let run_id = required_run_environment(markers::PHASE3_RUN_ID)?;
@@ -208,7 +207,7 @@ impl Phase3EvidenceIdentitySource {
             target,
             preg_sha256: collisions.preg_sha256(),
             breg_sha256: collisions.breg_sha256(),
-            candidate_physics,
+            candidate_physics: false,
             run_id,
             endpoint,
             bridge_endpoint,
@@ -747,7 +746,6 @@ impl Phase3EvidenceEmitter {
             return self.take_violation_marker();
         }
         let session_generation = identity.session_generation;
-        let candidate_physics = identity.candidate_physics;
         let mut markers = self.observe_identity(identity);
         if !self.pending_corrections.is_empty() {
             self.pending_corrections.clear();
@@ -757,15 +755,12 @@ impl Phase3EvidenceEmitter {
             MovementSource::Physics => "Physics",
             MovementSource::FreeCamera => "FreeCamera",
         };
-        if free_camera_packet_count != 0
-            || candidate_physics != matches!(source, MovementSource::Physics)
-        {
+        if free_camera_packet_count != 0 {
             self.record_violation("terminal_source_or_packet_mismatch");
         }
-        let expected_reconciliation = if candidate_physics {
-            MovementOutboxReconciliation::Drained
-        } else {
-            MovementOutboxReconciliation::NotAuthoritative
+        let expected_reconciliation = match source {
+            MovementSource::Physics => MovementOutboxReconciliation::Drained,
+            MovementSource::FreeCamera => MovementOutboxReconciliation::NotAuthoritative,
         };
         if pending_outbox_depth != 0 || outbox_reconciliation != expected_reconciliation {
             self.record_violation("terminal_outbox_not_drained");

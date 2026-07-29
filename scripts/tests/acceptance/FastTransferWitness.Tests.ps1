@@ -28,7 +28,7 @@ Describe 'FastTransferWitness focused LBSG acceptance' {
             schema = 'rust-mcbe-phase3-identity-v1'; build_commit = $script:BuildCommit
             target = 'Lbsg'; protocol = 1001; session_generation = 7
             preg_sha256 = $script:PregSha256; breg_sha256 = $script:BregSha256
-            candidate_physics = $true; source_dirty = $false; run_id = $script:RunId
+            candidate_physics = $false; source_dirty = $false; run_id = $script:RunId
             endpoint = 'play.lbsg.net:19132'; bridge_endpoint = $script:BridgeEndpoint
             core_sha256 = $script:CoreSha256; core_process_id = 41; app_process_id = 42
         }
@@ -488,12 +488,12 @@ Describe 'FastTransferWitness focused LBSG acceptance' {
         { Invoke-WitnessValidation $pending } | Should Throw
     }
 
-    It 'builds only the fixed authenticated LBSG candidate plan with a ten-minute minimum' {
+    It 'builds only the fixed authenticated LBSG production plan with a ten-minute minimum' {
         $plan = New-Phase3LaunchPlan -Target Lbsg -Endpoint 'play.lbsg.net:19132' `
             -RunId $script:RunId -SocketDirectory socket -MetricsPath metrics.json `
             -DurationSeconds 600 -Scenario FastTransferWitness -AuthCache token.json `
             -Assets vanilla.mcbea
-        ($plan.AppArguments -ccontains '--phase3-candidate-physics') | Should Be $true
+        ($plan.AppArguments -ccontains '--phase3-candidate-physics') | Should Be $false
         ($plan.CoreArguments -ccontains '-auth-cache') | Should Be $true
         { New-Phase3LaunchPlan -Target Lbsg -Endpoint 'play.lbsg.net:19132' `
                 -RunId $script:RunId -SocketDirectory socket -MetricsPath metrics.json `

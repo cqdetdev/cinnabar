@@ -95,7 +95,7 @@ pub(crate) fn advance_local_physics(
     }
     for sample in frame.samples {
         if let Err(fault) = movement_ticker.enqueue_completed_physics(sample) {
-            debug!(?fault, "candidate Physics movement authority failed closed");
+            debug!(?fault, "player Physics movement authority failed closed");
             physics.deactivate();
             return;
         }

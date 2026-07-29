@@ -288,11 +288,11 @@ function Assert-FastTransferWitnessEvidence {
     Assert-FastTransferInteger $identity.session_generation 'identity.session_generation' 1 ([decimal][uint64]::MaxValue)
     Assert-FastTransferInteger $identity.core_process_id 'identity.core_process_id' 1 ([decimal][int]::MaxValue)
     Assert-FastTransferInteger $identity.app_process_id 'identity.app_process_id' 1 ([decimal][int]::MaxValue)
-    if ($identity.candidate_physics -isnot [bool] -or -not [bool]$identity.candidate_physics -or
+    if ($identity.candidate_physics -isnot [bool] -or [bool]$identity.candidate_physics -or
         $identity.source_dirty -isnot [bool] -or [bool]$identity.source_dirty -or
         [int]$identity.core_process_id -ne $ExpectedCoreProcessId -or
         [int]$identity.app_process_id -ne $ExpectedAppProcessId) {
-        throw 'FastTransferWitness identity is dirty, non-candidate, or process-unattributed'
+        throw 'FastTransferWitness identity is dirty, candidate-only, or process-unattributed'
     }
 
     $actionEvidence = $actions[0]

@@ -74,8 +74,8 @@ if ($DryRun) {
     Write-Output "CORE_COMMAND=$(Format-ResolvedCommand $coreExecutable $plan.CoreArguments)"
     Write-Output "APP_COMMAND=$(Format-ResolvedCommand $appExecutable $plan.AppArguments)"
     Write-Output "PHASE3_SCENARIO=$Scenario"
-    Write-Output "PHASE3_CANDIDATE_PHYSICS=$($Scenario -cin @('CandidatePhysics', 'FastTransferWitness'))"
-    Write-Output 'PRODUCTION_PHYSICS_DEFAULT_ENABLED=false'
+    Write-Output 'PHASE3_CANDIDATE_PHYSICS=false'
+    Write-Output 'PRODUCTION_PHYSICS_DEFAULT_ENABLED=true'
     return
 }
 

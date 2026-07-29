@@ -27,7 +27,7 @@ It 'rejects hand-authored JSON without registered production marker prefixes' {
     $result.ExitCode | Should Not Be 0
 }
 
-It 'accepts a candidate verdict without a touch witness' {
+It 'accepts a production verdict without a touch witness' {
     $script:Frames[2].input_mode = 'KeyboardMouse'
     $script:Frames[3].input_mode = 'GamePad'
     $result = Invoke-Validator (Write-MarkerLog 'deferred-touch-valid.log')
@@ -40,7 +40,7 @@ It 'accepts a candidate verdict without a touch witness' {
     $touch[0].deferral_reason | Should Match 'Owner decision'
 }
 
-It 'keeps every non-Drained candidate terminal forbidden' {
+It 'keeps every non-Drained production terminal forbidden' {
     foreach ($terminalState in @(
         'SocketPending', 'BudgetDeferred', 'TransportRestored', 'FullRestored'
     )) {
@@ -63,12 +63,12 @@ It 'rejects an indeterminate Physics send violation marker' {
         Should Not Be 0
 }
 
-It 'defines Zeno as an authenticated five-minute candidate target' {
+It 'defines Zeno as an authenticated five-minute production target' {
     $endpoint = Get-Phase3TargetEndpoint -Target Zeno
     $endpoint | Should Be 'zenomc.org:19197'
     $plan = New-Phase3LaunchPlan -Target Zeno -Endpoint $endpoint `
         -RunId $script:RunId -SocketDirectory socket -MetricsPath metrics.json `
         -DurationSeconds 300 -Scenario CandidatePhysics -AuthCache token.json
     ($plan.CoreArguments -ccontains '-auth-cache') | Should Be $true
-    ($plan.AppArguments -ccontains '--phase3-candidate-physics') | Should Be $true
+    ($plan.AppArguments -ccontains '--phase3-candidate-physics') | Should Be $false
 }

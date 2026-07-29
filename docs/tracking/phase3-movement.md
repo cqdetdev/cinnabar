@@ -91,27 +91,33 @@ recomputed from an anchor. The rule is:
 - [ ] Compare movement, jumping, camera collision, F5 avatar, touch, and controller behavior against matching vanilla Bedrock.
 - [ ] Produce release resource/timing evidence at 30, 60, and 144 FPS caps.
 - [x] Complete independent review of the final integrated candidate range through `3a06b15`.
-- [ ] Land a separate reviewed change enabling normal-session physics.
+- [x] Stage a separate local change enabling normal-session physics.
+- [ ] Approve the local production enable after live/native/performance evidence.
 
 ## Open production-integration gaps established from code
 
-These were established by reading the implementation, not inferred from the tracker, and are
-deliberately left unfixed because each needs an authoritative vanilla reference this tranche
+This was established by reading the implementation, not inferred from the tracker, and is
+deliberately left unfixed because it needs an authoritative vanilla reference this tranche
 does not have:
 
 - `app/src/ui_runtime/gameplay_touch.rs` assigns only movement, `JUMP`, `USE`, and the four look
   axes. `SNEAK`, `SPRINT`, `ATTACK`, `PERSPECTIVE`, `MENU`, and all nine hotbar hit IDs have
   default bindings but no on-screen region, so they are unreachable by touch. Placing them
   requires a version-matched vanilla touch-layout reference and a rendered-frame acceptance pass.
-- `app/src/semantic_controls/physical.rs` gates the whole device frame on
-  `camera::input_is_active`, which requires a locked, hidden cursor. A touch-only or
-  controller-only session never locks the pointer, so neither device can deliver input. The fix
-  is bounded but changes the focus/release model, which should be decided against vanilla
-  behaviour rather than chosen here.
+
+The prior controller/touch reachability gap is closed: `input_source_gates` requires focus for
+controller and touch while cursor capture gates only keyboard/mouse, with a regression test for
+both states.
 
 ## Important current behavior
 
-Production deliberately starts with `PhysicsAuthorityGate::ProductionDisabled`; normal gameplay therefore remains FreeCamera unless the attributable candidate flag is used. Tests for candidate physics do not mean production physics is enabled. Nothing in this tranche changes that gate.
+Local `main` now starts with `PhysicsAuthorityGate::ProductionEnabled`. A normal
+non-auto-fly StartGame selects Physics only after complete pinned PREG/BREG
+collision coverage validates; `--auto-fly` remains FreeCamera and network-silent.
+The special candidate CLI authority path has been removed, so normal play and
+Phase 3 movement evidence exercise the same controller. This local enable has
+deterministic coverage but does not close the live/native/performance acceptance
+gate until the required controlled runs are recorded.
 
 ## Historical references
 

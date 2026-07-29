@@ -628,21 +628,21 @@ fn phase3_invalid_correction_and_non_monotonic_tick_emit_durable_violations() {
 }
 
 #[test]
-fn phase3_terminal_binds_candidate_and_free_camera_packet_silence() {
-    let identity = |candidate| {
+fn phase3_terminal_binds_production_physics_and_free_camera_packet_silence() {
+    let identity = || {
         Phase3EvidenceIdentity::new(
             "0123456789abcdef0123456789abcdef01234567",
             crate::args::Phase3Target::Bds,
             7,
             [0x11; 32],
             [0x22; 32],
-            candidate,
+            false,
         )
         .unwrap()
     };
-    let mut candidate = Phase3EvidenceEmitter::default();
-    let markers = candidate.observe_terminal(
-        identity(true),
+    let mut production = Phase3EvidenceEmitter::default();
+    let markers = production.observe_terminal(
+        identity(),
         MovementSource::Physics,
         3,
         0,
@@ -653,9 +653,9 @@ fn phase3_terminal_binds_candidate_and_free_camera_packet_silence() {
     assert!(markers[0].starts_with("RUST_MCBE_PHASE3_IDENTITY="));
     assert!(markers[1].starts_with("RUST_MCBE_PHASE3_TERMINAL="));
     assert!(
-        candidate
+        production
             .observe_terminal(
-                identity(true),
+                identity(),
                 MovementSource::Physics,
                 3,
                 0,
@@ -667,7 +667,7 @@ fn phase3_terminal_binds_candidate_and_free_camera_packet_silence() {
 
     let mut free = Phase3EvidenceEmitter::default();
     let markers = free.observe_terminal(
-        identity(false),
+        identity(),
         MovementSource::FreeCamera,
         0,
         0,
@@ -681,7 +681,7 @@ fn phase3_terminal_binds_candidate_and_free_camera_packet_silence() {
 
     let mut leaked = Phase3EvidenceEmitter::default();
     let markers = leaked.observe_terminal(
-        identity(false),
+        identity(),
         MovementSource::FreeCamera,
         0,
         1,
@@ -696,7 +696,7 @@ fn phase3_terminal_binds_candidate_and_free_camera_packet_silence() {
 
     let mut full = Phase3EvidenceEmitter::default();
     let markers = full.observe_terminal(
-        identity(true),
+        identity(),
         MovementSource::Physics,
         3,
         0,
@@ -722,7 +722,7 @@ fn phase3_terminal_fails_closed_when_a_correction_has_no_following_frame() {
         7,
         [0x11; 32],
         [0x22; 32],
-        true,
+        false,
     )
     .unwrap();
     let mut evidence = Phase3EvidenceEmitter::default();

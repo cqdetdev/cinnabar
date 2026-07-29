@@ -331,13 +331,7 @@ pub fn run(args: args::ClientArgs) -> Result<()> {
     );
     let phase3_identity_source = args
         .phase3_evidence_target
-        .map(|target| {
-            Phase3EvidenceIdentitySource::from_build(
-                target,
-                args.phase3_candidate_physics,
-                &collision_registries,
-            )
-        })
+        .map(|target| Phase3EvidenceIdentitySource::from_build(target, &collision_registries))
         .transpose()
         .context("bind Phase 3 evidence to this exact build and collision registry")?;
 
@@ -409,11 +403,7 @@ pub fn run(args: args::ClientArgs) -> Result<()> {
         .insert_resource(EnvironmentContext::default())
         .insert_resource(EnvironmentProfileRoute::default())
         .insert_resource(movement_ticker)
-        .insert_resource(if args.phase3_candidate_physics {
-            PhysicsAuthorityGate::CandidateEvidence
-        } else {
-            PhysicsAuthorityGate::ProductionDisabled
-        })
+        .insert_resource(PhysicsAuthorityGate::ProductionEnabled)
         .insert_resource(LocalPhysicsController::default())
         .insert_resource(collision_registries)
         .insert_resource(actor_render_scene)

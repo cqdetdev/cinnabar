@@ -29,7 +29,7 @@ Describe 'Phase 3 production marker evidence validation' {
             schema = 'rust-mcbe-phase3-identity-v1'; build_commit = $script:BuildCommit
             target = 'Bds'; protocol = 1001; session_generation = 7
             preg_sha256 = $script:PregSha256; breg_sha256 = $script:BregSha256
-            candidate_physics = $true
+            candidate_physics = $false
             source_dirty = $false; run_id = $script:RunId; endpoint = $script:Endpoint
             bridge_endpoint = $script:BridgeEndpoint
             core_sha256 = $script:CoreSha256; core_process_id = 41; app_process_id = 42
@@ -266,7 +266,7 @@ Describe 'Phase 3 production marker evidence validation' {
         $aggregate.evidence.terminal_free_camera_packet_count | Should Be 0
     }
 
-    It 'builds exact live target plans with candidate-only physics and no free camera' {
+    It 'builds exact live target plans with production physics and no free camera' {
         $targets = [ordered]@{
             Lunar = 'pvp.lunarbedrock.com:19134'
             Zeqa = 'zeqa.net:19132'
@@ -283,7 +283,7 @@ Describe 'Phase 3 production marker evidence validation' {
                 -RunId $script:RunId -SocketDirectory 'socket' -MetricsPath 'metrics.json' `
                 -DurationSeconds $duration -Scenario CandidatePhysics -AuthCache $authCache
             $plan.CoreArguments -join ' ' | Should Match ([regex]::Escape("-upstream $endpoint"))
-            ($plan.AppArguments -ccontains '--phase3-candidate-physics') | Should Be $true
+            ($plan.AppArguments -ccontains '--phase3-candidate-physics') | Should Be $false
             ($plan.AppArguments -ccontains '--phase3-evidence-target') | Should Be $true
             ($plan.AppArguments -ccontains '--auto-fly') | Should Be $false
             ($plan.CoreArguments -ccontains '-auth-cache') | Should Be ($target -cne 'Bds')
@@ -685,29 +685,24 @@ Describe 'Phase 3 production marker evidence validation' {
         $result = Invoke-Validator (Write-MarkerLog 'missing-replay.log')
         $result.ExitCode | Should Not Be 0
     }
-
     It 'rejects a missing snap witness as the only changed condition' {
         $script:Events = @($script:Events | Where-Object { $_.event_sequence -ne 1 })
         $result = Invoke-Validator (Write-MarkerLog 'missing-snap.log')
         $result.ExitCode | Should Not Be 0
     }
-
     It 'rejects a zero candidate terminal packet count as the only changed condition' {
         $script:Terminals[0].physics_packet_count = 0
         $result = Invoke-Validator (Write-MarkerLog 'terminal-count.log')
         $result.ExitCode | Should Not Be 0
     }
-
     It 'rejects a nonempty terminal outbox as the only changed condition' {
         $script:Terminals[0].pending_outbox_depth = 1
         (Invoke-Validator (Write-MarkerLog 'terminal-pending-outbox.log')).ExitCode | Should Not Be 0
     }
-
     It 'rejects a final Full restoration as the only changed condition' {
         $script:Terminals[0].outbox_reconciliation = 'FullRestored'
         (Invoke-Validator (Write-MarkerLog 'terminal-full-restored.log')).ExitCode | Should Not Be 0
     }
-
     It 'parses SocketPending as typed terminal state but rejects the Candidate terminal gate' {
         $script:Terminals[0].outbox_reconciliation = 'SocketPending'
         $result = Invoke-Validator (Write-MarkerLog 'terminal-socket-pending.log')
@@ -715,18 +710,15 @@ Describe 'Phase 3 production marker evidence validation' {
         $result.Output | Should Match 'CandidatePhysics terminal does not prove Physics packet production'
         $result.Output | Should Not Match 'terminal outbox_reconciliation is unsupported'
     }
-
     It 'rejects a nonzero app process exit as the only changed condition' {
         $script:RunMetadata.app_exit_code = 9
         (Invoke-Validator (Write-MarkerLog 'process-app-exit.log')).ExitCode | Should Not Be 0
     }
-
     It 'rejects a nonzero core process exit as the only changed condition' {
         $script:RunMetadata.core_exit_code = 7
         $script:RunMetadata.core_terminated_by_launcher = $false
         (Invoke-Validator (Write-MarkerLog 'process-core-exit.log')).ExitCode | Should Not Be 0
     }
-
     It 'rejects a string-coerced integer field as the only changed condition' {
         $script:Frames[0].session_generation = '7'
         (Invoke-Validator (Write-MarkerLog 'type-integer.log')).ExitCode | Should Not Be 0

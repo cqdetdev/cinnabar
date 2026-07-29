@@ -239,9 +239,9 @@ impl MovementTicker {
     /// Selects the source allowed to drive outbound movement.
     ///
     /// Changing authority always discards queued/history state so samples from
-    /// the prior source cannot cross the boundary. The production app leaves
-    /// this at [`MovementSource::FreeCamera`] until the server-authoritative
-    /// gate is explicitly enabled.
+    /// the prior source cannot cross the boundary. Production selects Physics
+    /// only after StartGame binds the complete collision registry; acceptance
+    /// auto-fly remains an isolated FreeCamera source.
     pub fn set_source(&mut self, source: MovementSource) {
         if self.source == source {
             return;

@@ -319,8 +319,8 @@ fn visible_local_is_reserved_even_when_the_world_frustum_excludes_its_body() {
 #[test]
 fn third_person_local_fallback_reaches_the_render_manifest_without_a_physics_frame() {
     assert_eq!(
-        PhysicsAuthorityGate::ProductionDisabled.authorize(false, true),
-        Ok(MovementSource::FreeCamera)
+        PhysicsAuthorityGate::ProductionEnabled.authorize(false, true),
+        Ok(MovementSource::Physics)
     );
     let local_frame = LocalPlayerFrameCarrier::default();
     assert!(local_frame.snapshot().is_none());

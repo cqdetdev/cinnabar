@@ -53,10 +53,7 @@ function New-Phase3LaunchPlan {
         '--metrics-out', $MetricsPath,
         '--phase3-evidence-target', $Target
     )
-    if ($Scenario -cin @('CandidatePhysics', 'FastTransferWitness')) {
-        $appArguments += '--phase3-candidate-physics'
-    }
-    else { $appArguments += '--auto-fly' }
+    if ($Scenario -ceq 'FreeCameraSilence') { $appArguments += '--auto-fly' }
     if (-not [string]::IsNullOrWhiteSpace($Assets)) { $appArguments += @('--assets', $Assets) }
     return [pscustomobject][ordered]@{
         Target = $Target

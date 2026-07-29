@@ -499,8 +499,8 @@ foreach ($hash in @(
     }
 }
 Assert-Boolean $identity.candidate_physics 'identity.candidate_physics'
-if ([bool]$identity.candidate_physics -ne $candidateScenario) {
-    throw 'identity candidate mode does not match the scenario manifest'
+if ([bool]$identity.candidate_physics) {
+    throw 'production movement evidence cannot use the retired candidate authority path'
 }
 Assert-Boolean $identity.source_dirty 'identity.source_dirty'
 if ([bool]$identity.source_dirty) { throw 'identity was compiled from dirty source' }

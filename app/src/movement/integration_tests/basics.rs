@@ -1,19 +1,19 @@
 #[test]
-fn candidate_physics_authority_is_explicit_complete_and_auto_fly_safe() {
+fn production_physics_authority_is_default_complete_and_auto_fly_safe() {
     assert_eq!(
-        PhysicsAuthorityGate::ProductionDisabled.authorize(false, true),
+        PhysicsAuthorityGate::default().authorize(false, true),
+        Ok(MovementSource::Physics)
+    );
+    assert_eq!(
+        PhysicsAuthorityGate::ProductionEnabled.authorize(true, true),
         Ok(MovementSource::FreeCamera)
     );
     assert_eq!(
-        PhysicsAuthorityGate::CandidateEvidence.authorize(true, true),
-        Ok(MovementSource::FreeCamera)
-    );
-    assert_eq!(
-        PhysicsAuthorityGate::CandidateEvidence.authorize(false, false),
+        PhysicsAuthorityGate::ProductionEnabled.authorize(false, false),
         Err(PhysicsAuthorityFault::IncompleteCollisionRegistry)
     );
     assert_eq!(
-        PhysicsAuthorityGate::CandidateEvidence.authorize(false, true),
+        PhysicsAuthorityGate::ProductionEnabled.authorize(false, true),
         Ok(MovementSource::Physics)
     );
 }
