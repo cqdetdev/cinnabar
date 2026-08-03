@@ -6,8 +6,7 @@ use valentine::bedrock::version::v1_26_30::{
     CorrectPlayerMovePredictionPacketPredictionType, GameMode, GameRuleI32, GameRuleI32Type,
     GameRuleI32Value, GameRuleVarintType, GameRuleVarintValue, LevelEventPacketEvent,
     McpePacketData, MovePlayerPacketMode, StartGamePacketDimension,
-    SubChunkEntryWithoutCachingItemResult, SubchunkPacketEntries, SubchunkRequestPacket, Vec3I8,
-    Vec3Li,
+    SubChunkEntryWithoutCachingItemResult, SubchunkPacketEntries,
 };
 
 use crate::{
@@ -32,6 +31,10 @@ use crate::{
         normalize_title, normalize_toast,
     },
 };
+
+mod requests;
+pub use self::requests::request_sub_chunk_column;
+use self::requests::{checked_sub_chunk_position, normalize_layer};
 
 /// Sequential palette state ID generated for `minecraft:air` in 1.26.30.
 pub const SEQUENTIAL_AIR_NETWORK_ID: u32 = 12_530;
@@ -265,17 +268,21 @@ pub struct LevelChunkEvent {
     pub payload: Vec<u8>,
 }
 
-/// Requests a fresh, ordinary SubChunk column after one cached transaction was abandoned.
+/// Requests fresh, ordinary SubChunk data after one cached transaction was abandoned.
 ///
 /// This is recovery control data, not substitute chunk content. The world streamer routes it
-/// through the normal bounded request and retry scheduler.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// through the normal bounded request and retry scheduler. When `requested_sub_chunk_ys` is
+/// present, it names the exact absolute section Ys to request for this column and takes
+/// precedence over `requested_sub_chunks`.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChunkResyncEvent {
     pub dimension: i32,
     pub x: i32,
     pub z: i32,
     /// `None` requests the dimension's full vanilla vertical range.
     pub requested_sub_chunks: Option<usize>,
+    /// Exact absolute section Ys to request for this column.
+    pub requested_sub_chunk_ys: Option<Vec<i32>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -306,6 +313,17 @@ pub struct SubChunkEntryEvent {
 pub struct SubChunkBatchEvent {
     pub dimension: i32,
     pub entries: Vec<SubChunkEntryEvent>,
+}
+/// Admission for a cached SubChunk response retained by the blob resolver.
+///
+/// This event carries no payload and does not mutate world state. It only
+/// lets the client-world retry scheduler retire the exact response deadlines
+/// while the reconstructed SubChunks event waits behind unresolved blobs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubChunkReplyAdmissionEvent {
+    pub dimension: i32,
+    /// Absolute sub-chunk coordinates in X/Y/Z order.
+    pub positions: Vec<[i32; 3]>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -483,6 +501,8 @@ pub enum WorldEvent {
     BiomeDefinitions(BiomeDefinitionsEvent),
     LevelChunk(LevelChunkEvent),
     ChunkResync(ChunkResyncEvent),
+    /// Confirms retained cached SubChunk replies before reconstruction.
+    SubChunkReplyAdmission(SubChunkReplyAdmissionEvent),
     SubChunks(SubChunkBatchEvent),
     BlockUpdates(Vec<BlockUpdateEvent>),
     BlockEntityUpdate(BlockEntityUpdateEvent),
@@ -930,67 +950,4 @@ fn canonical_biome_name(name: &str) -> Arc<str> {
     } else {
         Arc::from(name)
     }
-}
-
-/// Builds one bounded vertical-column SubChunkRequest.
-pub fn request_sub_chunk_column(
-    dimension: i32,
-    chunk_x: i32,
-    chunk_z: i32,
-    base_sub_chunk_y: i32,
-    count: usize,
-) -> Result<Packet, WorldPacketError> {
-    if count > MAX_SUB_CHUNK_REQUESTS {
-        return Err(WorldPacketError::TooManySubChunkRequests {
-            count,
-            max: MAX_SUB_CHUNK_REQUESTS,
-        });
-    }
-    let mut requests = Vec::with_capacity(count);
-    for offset in 0..count {
-        let offset_i32 = i32::try_from(offset).expect("request count is capped at 128");
-        base_sub_chunk_y.checked_add(offset_i32).ok_or(
-            WorldPacketError::SubChunkRequestYOverflow {
-                base_y: base_sub_chunk_y,
-                offset,
-            },
-        )?;
-        requests.push(Vec3I8 {
-            x: 0,
-            y: offset as i8,
-            z: 0,
-        });
-    }
-    Ok(SubchunkRequestPacket {
-        dimension,
-        requests,
-        origin: Vec3Li {
-            x: chunk_x,
-            y: base_sub_chunk_y,
-            z: chunk_z,
-        },
-    }
-    .into())
-}
-
-fn normalize_layer(layer: i32) -> Result<usize, WorldPacketError> {
-    let normalized =
-        usize::try_from(layer).map_err(|_| WorldPacketError::InvalidBlockLayer(layer))?;
-    if normalized >= MAX_BLOCK_LAYERS {
-        return Err(WorldPacketError::InvalidBlockLayer(layer));
-    }
-    Ok(normalized)
-}
-
-fn checked_sub_chunk_position(
-    origin: [i32; 3],
-    offset: [i8; 3],
-) -> Result<[i32; 3], WorldPacketError> {
-    let mut position = [0; 3];
-    for axis in 0..3 {
-        position[axis] = origin[axis]
-            .checked_add(i32::from(offset[axis]))
-            .ok_or(WorldPacketError::SubChunkPositionOverflow { origin, offset })?;
-    }
-    Ok(position)
 }

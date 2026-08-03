@@ -1,5 +1,7 @@
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::mem::size_of;
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use thiserror::Error;
@@ -9,7 +11,10 @@ use valentine::bedrock::version::v1_26_30::{
     SubChunkEntryWithoutCachingItemResult, SubchunkPacket, SubchunkPacketEntries,
 };
 
-use crate::{ChunkResyncEvent, Packet, WorldEvent};
+use crate::{ChunkResyncEvent, Packet, SubChunkReplyAdmissionEvent, WorldEvent};
+
+#[cfg(test)]
+static RECOVERY_ORDER_COMPARISONS: AtomicUsize = AtomicUsize::new(0);
 
 mod resolver;
 pub use resolver::{BlobCacheReady, BlobCacheStatus};
@@ -21,17 +26,23 @@ pub const CLIENT_BLOB_CACHE_TRIM_FLOOR_BYTES: usize = 80 * 1024 * 1024;
 pub const MAX_CLIENT_BLOB_HASHES_PER_PACKET: usize = 4_095;
 /// Cinnabar's own memory-safety bound, not a Bedrock protocol limit.
 ///
-/// Bedrock 1.26.30 enforces transfer concurrency on the server at 20, 40, 100, or 200 according
-/// to network status; its client has no corresponding cap. Keeping 256 retained transactions
-/// accepts the largest observed server setting with headroom while bounding remotely controlled
-/// resolver memory. Excess work is abandoned non-fatally and recovered through a chunk resync.
-pub const MAX_CLIENT_BLOB_PENDING_TRANSACTIONS: usize = 256;
+/// Version-matched BDS 1.26.32.2 at radius 16 legitimately drove more than 256 cached packet
+/// transactions concurrently; healthy pre-pressure runs measured high-water marks of 845 and
+/// 1,194. Retaining 2,048 transactions covers that observed vanilla burst while the independent
+/// 64 MiB aggregate byte bound below remains the primary remotely controlled memory ceiling.
+pub const MAX_CLIENT_BLOB_PENDING_TRANSACTIONS: usize = 2_048;
 /// Cinnabar's maximum aggregate accounted bytes across retained cached transactions.
 ///
 /// This is a Cinnabar memory-safety bound, not a vanilla or protocol limit. It independently
 /// charges decoded packet containers and inline payload capacities retained while cache misses are
 /// unresolved, even when reconstruction size is unknown and no cached payload is staged.
 pub const MAX_CLIENT_BLOB_PENDING_BYTES: usize = 64 * 1024 * 1024;
+/// Cinnabar's maximum queued chunk-resync events awaiting emission and conservatively reserved
+/// by retained cached transactions. This matches the transaction ceiling so a legitimate
+/// version-matched BDS burst does not become recovery pressure before it becomes transaction
+/// pressure. `pop_ready` drains recovery ahead of cached output, and duplicate column recoveries
+/// coalesce, keeping the concrete queue bounded independently from the reservation count.
+pub const MAX_CLIENT_BLOB_RECOVERY_READY_EVENTS: usize = 2_048;
 /// Ordinary decoded work is retained independently from cache transactions. The session receive
 /// loop stops reading as soon as any ordinary work is blocked, while this larger defensive ceiling
 /// keeps direct resolver users bounded too.
@@ -77,6 +88,8 @@ pub struct BlobCacheStats {
     pub hashes_classified: u64,
     pub hits: u64,
     pub misses: u64,
+    /// Absent hash references suppressed because another pending transaction already owns them.
+    pub redundant_missing_requests: u64,
     pub admitted_blobs: u64,
     pub rejected_blobs: u64,
     pub evictions: u64,
@@ -103,6 +116,12 @@ pub struct BlobCacheStats {
     pub miss_response_integrity_rejection: u64,
     pub miss_response_cache_pressure: u64,
     pub abandoned_cached_transactions: u64,
+    /// Distinct recovery events queued after coalescing.
+    ///
+    /// Two abandoned transactions recovering the same column produce one
+    /// `recovery_ready` entry and increment this once, so it tracks live
+    /// recovery traffic rather than pre-coalescing demand. A recovery returned
+    /// inline on a status packet is counted when it is queued.
     pub recovery_requests: u64,
     pub ordinary_backpressure: u64,
     pub reconstructed_level_chunks: u64,
@@ -271,6 +290,7 @@ struct PendingTransaction {
     packet: PendingPacket,
     hashes: Vec<u64>,
     unique_hashes: Vec<u64>,
+    owned_hashes: Vec<u64>,
     unresolved_hashes: usize,
     staged_bytes: usize,
     columns: Vec<ColumnKey>,
@@ -293,11 +313,72 @@ struct ImmediateReady {
     sequence: u64,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct ColumnKey {
     dimension: i32,
     x: i32,
     z: i32,
+}
+
+impl Ord for ColumnKey {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        #[cfg(test)]
+        RECOVERY_ORDER_COMPARISONS.fetch_add(1, AtomicOrdering::Relaxed);
+        self.dimension
+            .cmp(&other.dimension)
+            .then_with(|| self.x.cmp(&other.x))
+            .then_with(|| self.z.cmp(&other.z))
+    }
+}
+
+impl PartialOrd for ColumnKey {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+#[derive(Debug)]
+struct RecoveryReady {
+    dimension: i32,
+    x: i32,
+    z: i32,
+    requested_sub_chunks: Option<usize>,
+    requested_sub_chunk_ys: Option<BTreeSet<i32>>,
+}
+
+impl RecoveryReady {
+    fn from_event(event: ChunkResyncEvent) -> (ColumnKey, Self) {
+        let key = ColumnKey {
+            dimension: event.dimension,
+            x: event.x,
+            z: event.z,
+        };
+        let ys = event
+            .requested_sub_chunk_ys
+            .map(|ys| ys.into_iter().collect());
+        (
+            key,
+            Self {
+                dimension: event.dimension,
+                x: event.x,
+                z: event.z,
+                requested_sub_chunks: event.requested_sub_chunks,
+                requested_sub_chunk_ys: ys,
+            },
+        )
+    }
+
+    fn into_event(self) -> ChunkResyncEvent {
+        ChunkResyncEvent {
+            dimension: self.dimension,
+            x: self.x,
+            z: self.z,
+            requested_sub_chunks: self.requested_sub_chunks,
+            requested_sub_chunk_ys: self
+                .requested_sub_chunk_ys
+                .map(|ys| ys.into_iter().collect()),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -309,7 +390,7 @@ pub struct BlobCacheResolver {
     resolved_pending: BTreeSet<u64>,
     ready: BTreeMap<u64, ReadyTransaction>,
     immediate_ready: BTreeMap<u64, ImmediateReady>,
-    recovery_ready: VecDeque<ChunkResyncEvent>,
+    recovery_ready: BTreeMap<ColumnKey, RecoveryReady>,
     fast_transfer_reset_armed: bool,
     next_ready_sequence: u64,
     stats: BlobCacheStats,

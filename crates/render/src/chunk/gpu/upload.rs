@@ -1,5 +1,4 @@
 use crate::chunk::*;
-
 mod lighting;
 mod model_draw_bases;
 mod publication_removals;
@@ -12,11 +11,17 @@ pub(in crate::chunk) use lighting::{
 pub(in crate::chunk) use model_draw_bases::absolutize_model_draw_refs;
 pub(in crate::chunk) use model_draw_bases::absolutize_partitioned_model_draw_refs;
 use publication_removals::prepare_publication_removals;
-
+type AllChunkInstances<'w, 's> = Query<'w, 's, (Entity, &'static ChunkRenderInstance)>;
+type ChangedChunkInstances<'w, 's> =
+    Query<'w, 's, (Entity, &'static ChunkRenderInstance), Changed<ChunkRenderInstance>>;
+#[derive(SystemParam)]
+pub(in crate::chunk) struct ChunkInstanceQueries<'w, 's> {
+    queries: ParamSet<'w, 's, (AllChunkInstances<'w, 's>, ChangedChunkInstances<'w, 's>)>,
+}
 #[allow(clippy::too_many_arguments)]
 pub(in crate::chunk) fn prepare_gpu_chunks(
     mut commands: Commands,
-    instances: Query<(Entity, &ChunkRenderInstance)>,
+    mut instances: ChunkInstanceQueries<'_, '_>,
     views: Query<&ExtractedView, With<ExtractedCamera>>,
     mut removed_instances: RemovedComponents<ChunkRenderInstance>,
     mut arena: ResMut<ChunkGpuArena>,
@@ -30,17 +35,48 @@ pub(in crate::chunk) fn prepare_gpu_chunks(
     render_queue: Res<RenderQueue>,
     retirement_fence: Res<TransparentRetirementFence>,
     mut fairness: ResMut<GpuUpdateFairness>,
+    profiler: Option<Res<RuntimeStageProfiler>>,
 ) {
+    let _timer = profiler
+        .as_deref()
+        .map(|profiler| profiler.time(RuntimeStage::GpuPreparation));
     release_completed_transparent_retirements(&mut arena, retirement_fence.completed_epoch());
-    let candidates = instances
+    let active_tint_identity = biome_tints.table_identity();
+    let tint_identity_changed = fairness.last_tint_identity != Some(active_tint_identity);
+    let candidates = if tint_identity_changed {
+        instances
+            .queries
+            .p0()
+            .iter()
+            .map(|(entity, instance)| GpuUpdateCandidate::from_instance(entity, instance))
+            .collect()
+    } else {
+        let mut candidates = Vec::with_capacity(fairness.wait_ages.len());
+        {
+            let all_instances = instances.queries.p0();
+            candidates.extend(fairness.wait_ages.keys().filter_map(|&entity| {
+                all_instances
+                    .get(entity)
+                    .ok()
+                    .map(|(_, instance)| GpuUpdateCandidate::from_instance(entity, instance))
+            }));
+        }
+        candidates.extend(
+            instances
+                .queries
+                .p1()
+                .iter()
+                .filter(|(entity, _)| !fairness.wait_ages.contains_key(entity))
+                .map(|(entity, instance)| GpuUpdateCandidate::from_instance(entity, instance)),
+        );
+        candidates
+    };
+    let urgent_updates = candidates
         .iter()
-        .map(|(entity, instance)| GpuUpdateCandidate {
-            entity,
-            key: instance.key,
-            generation: instance.generation,
-            tint_identity: instance.tint_identity,
-        })
-        .collect();
+        .filter(|candidate| candidate.priority.is_urgent())
+        .map(|candidate| candidate.entity)
+        .collect::<Vec<_>>();
+    fairness.last_tint_identity = Some(active_tint_identity);
     let camera_position = views
         .iter()
         .next()
@@ -50,7 +86,7 @@ pub(in crate::chunk) fn prepare_gpu_chunks(
         candidates,
         &arena.allocations,
         camera_position,
-        biome_tints.table_identity(),
+        active_tint_identity,
         &fairness,
     );
 
@@ -71,8 +107,9 @@ pub(in crate::chunk) fn prepare_gpu_chunks(
     let mut applied_publication_permits = Vec::new();
     let mut successful_updates = Vec::new();
     let mut upload_reservation = GpuUploadReservation::default();
+    let all_instances = instances.queries.p0();
     for &entity in &selected {
-        let Ok((_, instance)) = instances.get(entity) else {
+        let Ok((_, instance)) = all_instances.get(entity) else {
             continue;
         };
         let instance_bytes = chunk_instance_upload_byte_len(instance);
@@ -146,13 +183,17 @@ pub(in crate::chunk) fn prepare_gpu_chunks(
                 continue;
             }
         };
-        if old.is_none()
-            && arena.free_origins.is_empty()
-            && arena.origin_len >= arena.limits.max_origin_items
-        {
-            bevy::log::warn!("chunk origin arena is at the adapter storage-buffer limit");
+        let Some(origin_plan) = plan_origin_allocation(
+            arena.origin_len,
+            arena.free_origins.len(),
+            arena.limits.max_origin_items,
+            old.is_some(),
+        ) else {
+            bevy::log::warn!(
+                "chunk origin arena cannot admit this allocation while preserving COW headroom"
+            );
             continue;
-        }
+        };
         let stream_counts = GeometryStreamCounts {
             cube: required,
             cube_lighting: cube_lighting_required,
@@ -163,15 +204,17 @@ pub(in crate::chunk) fn prepare_gpu_chunks(
             liquid: liquid_required,
             liquid_lighting: liquid_lighting_required,
         };
-        let preserve_old_geometry = old
+        // Every generation update rewrites GPU-visible data. Reusing a range
+        // that a previously submitted frame can still read lets a queued
+        // write mutate that frame in place, which presents as intermittent
+        // blank water, whole-chunk flashes, or stale geometry. Allocate a
+        // fresh complete allocation and keep the old one resident until the
+        // queue-completion fence proves that no submitted frame can refer to
+        // it anymore.
+        let preserve_old_allocation = old.is_some();
+        let retirement = old
             .as_ref()
-            .is_some_and(|old| transparent_geometry_update_requires_cow(old, stream_counts));
-        let retirement = preserve_old_geometry
-            .then(|| {
-                old.as_ref()
-                    .and_then(|old| RetiredArenaAllocation::geometry_only(entity, old))
-            })
-            .flatten();
+            .map(|old| RetiredArenaAllocation::full(entity, old.clone()));
         if let Some(retirement) = retirement.as_ref()
             && !arena
                 .retirement_budget
@@ -182,6 +225,7 @@ pub(in crate::chunk) fn prepare_gpu_chunks(
             }
             continue;
         }
+        let reusable_old = (!preserve_old_allocation).then_some(old.as_ref()).flatten();
         let Some(projected_ranges) = plan_chunk_range_update(
             arena.quad_len,
             &arena.free_quads,
@@ -191,15 +235,13 @@ pub(in crate::chunk) fn prepare_gpu_chunks(
             &arena.free_biomes,
             stream_counts,
             biome_required,
-            old.as_ref(),
-            preserve_old_geometry,
+            reusable_old,
+            false,
             arena.limits,
         ) else {
             continue;
         };
-        let projected_origin_len = arena
-            .origin_len
-            .saturating_add(usize::from(old.is_none() && arena.free_origins.is_empty()));
+        let projected_origin_len = origin_plan.projected_origin_len;
         let Some(projected_growth_copy_bytes) = planned_arena_growth_copy_bytes(
             ArenaRequiredLengths {
                 quads: arena.quad_capacity,
@@ -283,11 +325,8 @@ pub(in crate::chunk) fn prepare_gpu_chunks(
             assert!(arena.retirement_budget.try_reserve(1, bytes));
             arena.retired_allocations.push(retirement);
         }
-        let metadata_index = match old {
-            Some(old) => old.gpu.metadata_index,
-            None => allocate_origin(&mut arena)
-                .expect("origin capacity was checked before quad allocation"),
-        };
+        let metadata_index = allocate_origin(&mut arena)
+            .expect("origin capacity was checked before quad allocation");
         let cube_range = checked_geometry_range(plan.quad_start, required);
         let cube_lighting_range = checked_geometry_range(
             plan.cube_lighting_start,
@@ -486,7 +525,7 @@ pub(in crate::chunk) fn prepare_gpu_chunks(
         }
         successful_updates.push(entity);
     }
-    fairness.finish_frame(&selected, &successful_updates);
+    fairness.finish_frame(&selected, &successful_updates, &urgent_updates);
 
     let quad_incremental_bytes = quad_writes.iter().fold(0_u64, |total, (_, words)| {
         total.saturating_add(buffer_byte_len(words.len(), PACKED_QUAD_BYTES))
@@ -957,16 +996,4 @@ pub(in crate::chunk) fn validate_partitioned_model_streams(
     opaque_index == opaque_draw_refs.len()
         && blend_index == blend_draw_refs.len()
         && expected_lighting_base == model_lighting.len()
-}
-
-pub(in crate::chunk) fn absolutize_liquid_lighting_indices(
-    liquid_quads: &mut [[u32; 4]],
-    lighting_word_start: u32,
-) {
-    let lighting_record_base = lighting_word_start / 2;
-    for words in liquid_quads {
-        words[3] = words[3]
-            .checked_add(lighting_record_base)
-            .expect("atomic liquid-lighting arena plan fits u32 record addressing");
-    }
 }

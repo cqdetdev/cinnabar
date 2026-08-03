@@ -121,11 +121,16 @@ pub struct ViewCohortStatus {
 
 impl ViewCohortStatus {
     #[must_use]
-    pub fn is_exact(self) -> bool {
+    pub fn target_is_complete(self) -> bool {
         self.committed == Some(self.target)
             && self.expected != 0
             && self.loaded_target == self.expected
             && self.missing_target == 0
+    }
+
+    #[must_use]
+    pub fn is_exact(self) -> bool {
+        self.target_is_complete()
             && self.foreign_loaded == 0
             && self.foreign_requested == 0
             && self.foreign_resident == 0
@@ -291,12 +296,14 @@ pub enum WorldMeshChange {
         tint_identity: ChunkBiomeTintIdentity,
         generation: u64,
         dirty_since: Instant,
+        urgent: bool,
         permit: Option<PublicationPermit>,
     },
     Remove {
         key: SubChunkKey,
         generation: u64,
         dirty_since: Instant,
+        urgent: bool,
         permit: Option<PublicationPermit>,
     },
 }
@@ -733,6 +740,7 @@ pub(super) struct PendingMesh {
     pub(super) revision: u64,
     pub(super) since: Instant,
     pub(super) queued_at: Instant,
+    pub(super) urgent: bool,
 }
 
 #[derive(Debug)]
@@ -748,4 +756,5 @@ pub(super) struct MeshCompletion {
     pub(super) light_halo: MeshLightHalo,
     pub(super) queue_wait: Duration,
     pub(super) duration: Duration,
+    pub(super) urgent: bool,
 }

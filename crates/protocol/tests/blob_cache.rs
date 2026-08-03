@@ -1,6 +1,7 @@
 use protocol::{
     BedrockSession, BlobCacheError, BlobCacheLimits, BlobCacheReady, BlobCacheResolver,
-    BlockUpdateEvent, ClientBlobCache, SetTimeEvent, WorldEvent, client_blob_hash,
+    BlockUpdateEvent, ChunkResyncEvent, ClientBlobCache, SetTimeEvent, WorldEvent,
+    client_blob_hash,
 };
 use std::sync::{Arc, Barrier};
 use valentine::bedrock::version::v1_26_30::{
@@ -12,6 +13,8 @@ use valentine::bedrock::version::v1_26_30::{
 
 #[path = "blob_cache/head_of_line.rs"]
 mod head_of_line;
+#[path = "blob_cache/outstanding_recovery.rs"]
+mod outstanding_recovery;
 #[path = "blob_cache/resolver_lifecycle.rs"]
 mod resolver_lifecycle;
 
@@ -63,6 +66,40 @@ fn cached_subchunk(hash: u64, tail: &[u8]) -> protocol::Packet {
                 result: SubChunkEntryWithCachingItemResult::SuccessAllAir,
                 blob_id: u64::MAX,
                 ..Default::default()
+            },
+        ]),
+    }
+    .into()
+}
+
+fn cached_subchunk_multi_column(hash: u64, tail: &[u8]) -> protocol::Packet {
+    SubchunkPacket {
+        dimension: 0,
+        origin: Vec3I { x: 4, y: -4, z: 9 },
+        entries: SubchunkPacketEntries::SubChunkEntryWithCaching(vec![
+            SubChunkEntryWithCachingItem {
+                dx: 0,
+                dy: 1,
+                dz: 0,
+                result: SubChunkEntryWithCachingItemResult::Success,
+                payload: Some(tail.to_vec()),
+                heightmap_type: HeightMapDataType::NoData,
+                heightmap: None,
+                render_heightmap_type: HeightMapDataType::NoData,
+                render_heightmap: None,
+                blob_id: hash,
+            },
+            SubChunkEntryWithCachingItem {
+                dx: 3,
+                dy: 3,
+                dz: 4,
+                result: SubChunkEntryWithCachingItemResult::Success,
+                payload: Some(tail.to_vec()),
+                heightmap_type: HeightMapDataType::NoData,
+                heightmap: None,
+                render_heightmap_type: HeightMapDataType::NoData,
+                render_heightmap: None,
+                blob_id: hash,
             },
         ]),
     }
@@ -877,12 +914,19 @@ fn one_response_resolves_every_transaction_waiting_for_the_same_blob() {
     let payload = b"shared-response";
     let hash = client_blob_hash(payload);
     let mut resolver = BlobCacheResolver::new(ClientBlobCache::default());
-    for x in [1, 2] {
+    for (index, x) in [1, 2].into_iter().enumerate() {
         let status = resolver
             .accept_cached_packet(cached_request_level(x, hash))
             .expect("authorize shared miss");
-        assert_eq!(status.missing(), [hash]);
+        if index == 0 {
+            assert_eq!(status.missing(), [hash]);
+        } else {
+            assert!(status.missing().is_empty());
+            assert!(status.have().is_empty());
+            assert!(status.into_packets().is_empty());
+        }
     }
+    assert_eq!(resolver.stats().redundant_missing_requests, 1);
 
     let response = || ClientCacheMissResponsePacket {
         blobs: vec![Blob {
@@ -901,28 +945,63 @@ fn one_response_resolves_every_transaction_waiting_for_the_same_blob() {
 }
 
 #[test]
-fn resolver_accepts_authorized_response_after_another_resolver_fills_shared_cache() {
-    let payload = b"cross-resolver";
+fn abandoning_a_hash_owner_promotes_waiter_and_keeps_late_response_authorized() {
+    let payload = b"orphaned-waiter";
     let hash = client_blob_hash(payload);
-    let cache = ClientBlobCache::default();
-    let mut first = BlobCacheResolver::new(cache.clone());
-    let mut second = BlobCacheResolver::new(cache);
-    first
-        .accept_cached_packet(cached_request_level(1, hash))
-        .expect("first authorization");
-    second
-        .accept_cached_packet(cached_request_level(2, hash))
-        .expect("second authorization");
-    let response = || ClientCacheMissResponsePacket {
-        blobs: vec![Blob {
-            hash,
-            payload: payload.to_vec(),
-        }],
-    };
+    let mut resolver = BlobCacheResolver::new(ClientBlobCache::default());
 
-    first.accept_miss_response(response()).expect("first fill");
-    second
-        .accept_miss_response(response())
-        .expect("second resolver retains independent authorization");
-    let _ = pop_packet(&mut second, "second resolver transaction");
+    resolver
+        .accept_cached_packet(cached_request_level(21, hash))
+        .expect("authorize the real hash owner");
+    let waiter = resolver
+        .accept_cached_packet(cached_request_level(22, hash))
+        .expect("register a waiter without re-requesting the hash");
+    assert!(waiter.into_packets().is_empty());
+    resolver
+        .accept_world_event(
+            WorldEvent::BlockUpdates(vec![BlockUpdateEvent {
+                dimension: 0,
+                position: [21 * 16, 0, 0],
+                layer: 0,
+                network_id: 0,
+            }]),
+            1,
+        )
+        .expect("retain the ordinary event that abandons only the owner column");
+
+    assert!(
+        resolver
+            .unblock_ordinary_lane()
+            .expect("owner abandonment remains non-fatal")
+    );
+    assert_eq!(resolver.stats().pending_transactions, 1);
+    match resolver.pop_ready() {
+        Some(BlobCacheReady::WorldEvent(WorldEvent::ChunkResync(recovery))) => {
+            assert_eq!(recovery.x, 21);
+            assert_eq!(recovery.requested_sub_chunks, None);
+            assert_eq!(recovery.requested_sub_chunk_ys, None);
+        }
+        other => panic!("expected recovery for abandoned owner, got {other:?}"),
+    }
+
+    resolver
+        .accept_miss_response(ClientCacheMissResponsePacket {
+            blobs: vec![Blob {
+                hash,
+                payload: payload.to_vec(),
+            }],
+        })
+        .expect("a late response remains authorized by the promoted waiter");
+    assert_eq!(resolver.stats().pending_transactions, 0);
+    let packet = pop_packet(&mut resolver, "promoted waiter column");
+    let McpePacketData::PacketLevelChunk(packet) = packet.data else {
+        panic!("expected the promoted waiter to reconstruct as a LevelChunk");
+    };
+    assert_eq!(packet.x, 22);
+    assert!(matches!(
+        resolver.pop_ready(),
+        Some(BlobCacheReady::WorldEvent(WorldEvent::BlockUpdates(_)))
+    ));
+    assert!(resolver.pop_ready().is_none());
+    assert_eq!(resolver.stats().recovery_requests, 1);
 }

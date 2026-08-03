@@ -31,7 +31,7 @@ use bevy::{
     render::{
         Render, RenderApp, RenderStartup, RenderSystems,
         camera::ExtractedCamera,
-        extract_component::{ExtractComponent, ExtractComponentPlugin},
+        extract_component::ExtractComponent,
         extract_resource::{ExtractResource, ExtractResourcePlugin},
         render_phase::{
             AddRenderCommand, BinnedRenderPhaseType, DrawFunctions, InputUniformIndex, PhaseItem,
@@ -66,12 +66,13 @@ use world::SubChunkKey;
 
 use crate::{
     AtmosphereFrame, ChunkMesh, PackedBiomeRecord, PackedLiquidQuad, PackedModelDrawRef,
-    PackedModelRef, PackedQuad, PackedQuadLighting,
+    PackedModelRef, PackedQuad, PackedQuadLighting, RuntimeStage, RuntimeStageProfiler,
     atmosphere_render::{AtmosphereGpu, install_atmosphere},
     visibility_diagnostics::{
         ActiveVisibilityFrameProbe, ExtractedCameraIdentity, ExtractedCameraIdentityTracker,
         GraphicsAdapterMetadata, MAX_VISIBILITY_DIAGNOSTIC_KEYS, OpaqueDrawMode,
-        VisibilityDiagnostics, VisibilityDiagnosticsInput, VisibilityFrameProbe, hash_f32_words,
+        VisibilityCompletionFence, VisibilityDiagnostics, VisibilityDiagnosticsInput,
+        VisibilityFrameProbe, hash_f32_words,
     },
 };
 
@@ -126,8 +127,8 @@ use gpu::arena::{
     allocate_aligned_quad_range, allocate_aligned_range_for_update, allocate_origin,
     allocate_quad_range, allocate_range_for_update, arena_limits_from_device_limits,
     checked_geometry_range, chunk_tint_identity_is_active, commit_chunk_range_plan,
-    create_indirect_buffer, create_storage_buffer, free_allocation, init_chunk_gpu_arena,
-    insert_free_quad_range, plan_chunk_range_update, plan_gpu_chunk_updates,
+    create_indirect_buffer, create_storage_buffer, init_chunk_gpu_arena, insert_free_quad_range,
+    plan_chunk_range_update, plan_gpu_chunk_updates, plan_origin_allocation,
     release_completed_transparent_retirements, release_origin, release_quad_range,
     take_free_quad_range,
 };
@@ -143,6 +144,8 @@ use gpu::bind_groups::{
     prepare_chunk_biome_tints, prepare_chunk_texture_assets, storage_table_fits,
     upload_texture_page,
 };
+#[cfg(test)]
+use gpu::layout::transparent_geometry_update_requires_cow;
 #[allow(unused_imports)]
 use gpu::layout::{
     ArenaGrowthError, ArenaGrowthPlan, ArenaRequiredLengths, GeometryStreamCounts,
@@ -150,19 +153,19 @@ use gpu::layout::{
     account_chunk_gpu_uploads, arena_growth_copy_ceiling, buffer_byte_len, checked_align_up,
     copy_gpu_buffer, ensure_biome_capacity, ensure_geometry_stream_capacities,
     ensure_origin_capacity, ensure_quad_capacity, ensure_stream_capacity, plan_arena_growth,
-    planned_arena_growth_copy_bytes, transparent_geometry_update_requires_cow,
-    write_stream_records,
+    planned_arena_growth_copy_bytes, write_stream_records,
 };
 #[allow(unused_imports)]
 use gpu::types::{
     ArenaAllocation, ChunkDepthLiquidIndirectBatches, ChunkDrawMode, ChunkIndirectBatch,
     ChunkIndirectBatches, ChunkModelIndirectBatches, GpuChunkAllocation, GpuChunkOrigin,
     LEGACY_FIXED_MODEL_QUADS_PER_REF, MODEL_INDEX_COUNT, QueueFrameProbeParams,
-    RetiredArenaAllocation, StreamAddresses, adapter_metadata_field, cube_lighting_record_address,
-    cube_stream_addresses_valid, depth_liquid_direct_draw_command, depth_liquid_draw_command,
-    depth_liquid_mdi_draw_command, diagnostic_draw_mode, direct_stream_addresses,
-    extracted_camera_identity, gpu_chunk_origin, indexed_indirect_command, mdi_stream_addresses,
-    metadata_base_vertex, model_direct_draw_command, model_draw_command, model_mdi_draw_command,
+    RetiredArenaAllocation, StreamAddresses, absolutize_liquid_lighting_indices,
+    adapter_metadata_field, cube_lighting_record_address, cube_stream_addresses_valid,
+    depth_liquid_direct_draw_command, depth_liquid_draw_command, depth_liquid_mdi_draw_command,
+    diagnostic_draw_mode, direct_stream_addresses, extracted_camera_identity, gpu_chunk_origin,
+    indexed_indirect_command, mdi_stream_addresses, metadata_base_vertex,
+    model_direct_draw_command, model_draw_command, model_mdi_draw_command,
     model_ref_count_for_witness, opaque_allocation_is_drawable, publish_graphics_runtime_metadata,
     resolve_surface_present_mode, select_chunk_draw_mode, shared_stream_ranges_disjoint,
     summarize_model_workload, surface_present_mode_name, transparent_model_direct_draw_command,
@@ -170,11 +173,10 @@ use gpu::types::{
 };
 #[allow(unused_imports)]
 use gpu::upload::{
-    absolutize_liquid_lighting_indices, absolutize_model_lighting_bases,
-    absolutize_partitioned_model_draw_refs, chunk_instance_upload_byte_len, liquid_quad_centroid,
-    packed_lighting_records, packed_stream_range_matches, prepare_gpu_chunks,
-    transparent_allocation_matches, transparent_model_allocation_matches,
-    validate_partitioned_model_streams,
+    absolutize_model_lighting_bases, absolutize_partitioned_model_draw_refs,
+    chunk_instance_upload_byte_len, liquid_quad_centroid, packed_lighting_records,
+    packed_stream_range_matches, prepare_gpu_chunks, transparent_allocation_matches,
+    transparent_model_allocation_matches, validate_partitioned_model_streams,
 };
 #[allow(unused_imports)]
 use pipeline::commands::{

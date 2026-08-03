@@ -9,6 +9,25 @@ use super::{
 };
 use crate::chunk::*;
 
+// Transparent ordering does not need a new CPU sort for sub-pixel camera
+// movement. Quantising only the cache key keeps the exact camera matrix in
+// `TransparentSortWork`, while allowing the newest committed order to be
+// reused through ordinary head motion and mouse jitter.
+const CAMERA_POSITION_SORT_QUANTUM: f32 = 1.0 / 64.0;
+const CAMERA_ORIENTATION_SORT_QUANTUM: f32 = 1.0 / 1024.0;
+
+fn quantize_camera_component(value: f32, quantum: f32) -> f32 {
+    (value / quantum).round() * quantum
+}
+
+fn quantized_camera_position(position: [f32; 3]) -> [f32; 3] {
+    position.map(|value| quantize_camera_component(value, CAMERA_POSITION_SORT_QUANTUM))
+}
+
+fn quantized_camera_orientation(orientation: [f32; 4]) -> [f32; 4] {
+    orientation.map(|value| quantize_camera_component(value, CAMERA_ORIENTATION_SORT_QUANTUM))
+}
+
 pub(in crate::chunk) fn transparent_snapshot_addresses_are_resident<'a, 'b>(
     snapshot: &TransparentOrderedSnapshot,
     resident_allocations: impl IntoIterator<Item = &'a GpuChunkAllocation>,
@@ -153,7 +172,12 @@ pub(in crate::chunk) fn prepare_transparent_sorts(
     witness_request: Res<TransparentWitnessRequest>,
     witness_evidence: Res<TransparentWitnessEvidence>,
     mut upload_budget: ResMut<TransparentUploadBudget>,
+    profiler: Option<Res<RuntimeStageProfiler>>,
 ) {
+    let worker_profiler = profiler.as_deref().cloned();
+    let _timer = profiler
+        .as_deref()
+        .map(|profiler| profiler.time(RuntimeStage::TransparentPreparation));
     upload_budget.reset();
     let completed = {
         let receiver = runtime
@@ -242,7 +266,7 @@ pub(in crate::chunk) fn prepare_transparent_sorts(
             Err(TransparentSortError::InvalidCameraTransform) => {}
         }
         if let Some((_generation, work)) = next {
-            spawn_transparent_sort(runtime.result_sender.clone(), work);
+            spawn_transparent_sort(runtime.result_sender.clone(), work, worker_profiler.clone());
         }
         runtime.prune_request_metadata();
     }
@@ -296,8 +320,8 @@ pub(in crate::chunk) fn prepare_transparent_sorts(
     let texture_identity = texture_assets.identity();
     let tint_identity = biome_tints.table_identity();
     let key = match ViewSortKey::try_new(
-        translation.to_array(),
-        rotation.to_array(),
+        quantized_camera_position(translation.to_array()),
+        quantized_camera_orientation(rotation.to_array()),
         manifest,
         texture_identity,
         tint_identity,
@@ -439,7 +463,11 @@ pub(in crate::chunk) fn prepare_transparent_sorts(
                         runtime.staged_distinct_tint_counts.remove(&replaced);
                     }
                     if let Some((_generation, work)) = start {
-                        spawn_transparent_sort(runtime.result_sender.clone(), work);
+                        spawn_transparent_sort(
+                            runtime.result_sender.clone(),
+                            work,
+                            worker_profiler.clone(),
+                        );
                     }
                     runtime.prune_request_metadata();
                 }

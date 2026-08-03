@@ -215,6 +215,7 @@ Describe 'Phase 3 production marker evidence validation' {
         $result.ExitCode | Should Be 0; $result.Output | Should Match 'Phase 3 network pump terminal diagnostic:'; $result.Output | Should Match 'connection\s+reset'
         $result.Output | Should Match 'PHASE3_EVIDENCE_VALID target=Bds .* frames=5 events=3'
         $aggregate = Get-Content -Raw -LiteralPath $result.Aggregate | ConvertFrom-Json
+        $aggregate.candidate.production_physics_default_enabled | Should Be $false
         $aggregate.movement.held_jump_longest_run | Should Be 2
         $aggregate.camera_avatar.perspective_sequence -join ',' | Should Be 'FirstPerson,ThirdPersonBack,ThirdPersonFront,FirstPerson'
         $aggregate.evidence.terminal_pending_outbox_depth | Should Be 0
@@ -313,10 +314,14 @@ Describe 'Phase 3 production marker evidence validation' {
         ($bds.CoreArguments -ccontains '-auth-cache') | Should Be $false
     }
 
-    It 'builds a distinct network-silent FreeCamera scenario without candidate physics frames' {
-        $plan = New-Phase3LaunchPlan -Target Lunar -Endpoint (Get-Phase3TargetEndpoint Lunar) `
+    It 'builds a case-insensitive network-silent FreeCamera scenario without candidate physics frames' {
+        $plan = New-Phase3LaunchPlan -Target lunar -Endpoint (Get-Phase3TargetEndpoint lunar) `
             -RunId $script:RunId -SocketDirectory socket -MetricsPath metrics.json `
-            -DurationSeconds 300 -Scenario FreeCameraSilence -AuthCache token.json
+            -DurationSeconds 300 -Scenario freecamerasilence -AuthCache token.json
+        $plan.Target | Should Be 'Lunar'
+        $plan.Scenario | Should Be 'FreeCameraSilence'
+        $targetIndex = [Array]::IndexOf($plan.AppArguments, '--phase3-evidence-target')
+        $plan.AppArguments[$targetIndex + 1] | Should Be 'Lunar'
         ($plan.AppArguments -ccontains '--auto-fly') | Should Be $true
         ($plan.AppArguments -ccontains '--phase3-candidate-physics') | Should Be $false
         ($plan.CoreArguments -ccontains '-auth-cache') | Should Be $true
@@ -331,6 +336,8 @@ Describe 'Phase 3 production marker evidence validation' {
         $launcher | Should Match '-AuthCache \$authCacheFull'
         $launcher | Should Match '-ScenarioManifestPath \$scenarioManifestPath'
         $launcher | Should Match '\[Collections\.Generic\.List\[object\]\]::new\(\)'
+        $launcher | Should Match '\$Target = ConvertTo-Phase3Target -Target \$Target'
+        $launcher | Should Match '\$Scenario = ConvertTo-Phase3Scenario -Scenario \$Scenario'
     }
 
     It 'serializes empty screenshot evidence as a JSON array under Windows PowerShell' {
@@ -770,30 +777,6 @@ Describe 'Phase 3 production marker evidence validation' {
         (Invoke-Validator (Write-MarkerLog 'post-dimension-tick-gap.log')).ExitCode | Should Not Be 0
     }
 
-    It 'rejects an event session mismatch as the only changed condition' {
-        $script:Events[0].session_generation = 8
-        (Invoke-Validator (Write-MarkerLog 'event-session.log')).ExitCode | Should Not Be 0
-    }
-
-    It 'rejects an event FIFO mismatch as the only changed condition' {
-        $script:Events[0].fifo_sequence = 99
-        (Invoke-Validator (Write-MarkerLog 'event-fifo.log')).ExitCode | Should Not Be 0
-    }
-
-    It 'rejects an event physics-tick mismatch as the only changed condition' {
-        $script:Events[0].physics_tick = 99
-        (Invoke-Validator (Write-MarkerLog 'event-tick.log')).ExitCode | Should Not Be 0
-    }
-
-    It 'rejects an event dimension mismatch as the only changed condition' {
-        $script:Events[0].dimension = 1
-        (Invoke-Validator (Write-MarkerLog 'event-dimension.log')).ExitCode | Should Not Be 0
-    }
-
-    It 'rejects an out-of-range movement vector as the only changed condition' {
-        $script:Frames[0].movement = @(2.0, 0.0)
-        (Invoke-Validator (Write-MarkerLog 'bound-movement.log')).ExitCode | Should Not Be 0
-    }
-
+    . (Join-Path $PSScriptRoot 'Phase3.EventCases.ps1')
     . (Join-Path $PSScriptRoot 'Phase3.BoundaryCases.ps1')
 }

@@ -481,9 +481,21 @@ impl PhysicsAuthorityFaultRecord {
             PhysicsAuthorityFault::InvalidCompletedSample => {
                 ("invalid_completed_sample", serde_json::Value::Null)
             }
-            PhysicsAuthorityFault::PhysicsTickOverflow { dropped } => (
+            PhysicsAuthorityFault::PhysicsTickOverflow { due, dropped } => (
                 "physics_tick_overflow",
-                serde_json::json!({"dropped": dropped}),
+                serde_json::json!({"due": due, "dropped": dropped}),
+            ),
+            PhysicsAuthorityFault::PhysicsSimulationError {
+                due,
+                tick_index,
+                error,
+            } => (
+                "physics_simulation_error",
+                serde_json::json!({
+                    "due": due,
+                    "tick_index": tick_index,
+                    "simulation_error": simulation_error_detail(&error),
+                }),
             ),
             PhysicsAuthorityFault::CorrectionNotRetained { tick } => {
                 ("correction_not_retained", serde_json::json!({"tick": tick}))
@@ -524,6 +536,30 @@ impl PhysicsAuthorityFaultRecord {
                 "detail": detail,
             })
         )
+    }
+}
+
+fn simulation_error_detail(error: &sim::SimulationError) -> serde_json::Value {
+    match error {
+        sim::SimulationError::NonFiniteState { field } => serde_json::json!({
+            "kind": "non_finite_state",
+            "field": field,
+            "message": error.to_string(),
+        }),
+        sim::SimulationError::NonFiniteInput { field } => serde_json::json!({
+            "kind": "non_finite_input",
+            "field": field,
+            "message": error.to_string(),
+        }),
+        sim::SimulationError::World(world_error) => serde_json::json!({
+            "kind": "world",
+            "message": world_error.to_string(),
+            "debug": format!("{world_error:?}"),
+        }),
+        sim::SimulationError::TickOverflow => serde_json::json!({
+            "kind": "tick_overflow",
+            "message": error.to_string(),
+        }),
     }
 }
 
@@ -789,13 +825,18 @@ pub(crate) fn emit_phase3_evidence(
     identity_source: Option<Res<Phase3EvidenceIdentitySource>>,
     mut evidence: ResMut<Phase3EvidenceEmitter>,
 ) {
+    // Socket acknowledgements retain one immutable tick record until this
+    // system runs. Drain it in normal production too; otherwise a client
+    // without an acceptance identity permanently fills the bounded evidence
+    // queue after 32 successful movement packets and disables physics.
+    let completed_ticks = movement.take_tick_evidence();
     if !acceptance.enabled() {
         return;
     }
     let Some(identity_source) = identity_source else {
         return;
     };
-    if let Some(fault) = movement.pending_authority_fault()
+    if let Some(fault) = movement.pending_authority_fault().cloned()
         && let Ok(identity) = identity_source.for_session(fault.session_generation)
     {
         let retained = movement
@@ -820,7 +861,6 @@ pub(crate) fn emit_phase3_evidence(
         Ok(identity) => identity,
         Err(_) => return,
     };
-    let completed_ticks = movement.take_tick_evidence();
     let mut markers = evidence.observe_identity(identity);
     markers.extend(evidence.observe_completed_ticks(&completed_ticks));
     if markers.is_empty() {

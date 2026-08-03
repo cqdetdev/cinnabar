@@ -29,8 +29,8 @@ pub use blob_cache::{
     ClientBlobCache, MAX_CLIENT_BLOB_HASHES_PER_PACKET, MAX_CLIENT_BLOB_ORDINARY_READY_BYTES,
     MAX_CLIENT_BLOB_ORDINARY_READY_EVENTS, MAX_CLIENT_BLOB_PENDING_BYTES,
     MAX_CLIENT_BLOB_PENDING_TRANSACTIONS, MAX_CLIENT_BLOB_READY_BYTES,
-    MAX_CLIENT_BLOB_RECONSTRUCTED_BYTES, MAX_CLIENT_BLOB_STAGED_BYTES_PER_TRANSACTION,
-    client_blob_hash,
+    MAX_CLIENT_BLOB_RECONSTRUCTED_BYTES, MAX_CLIENT_BLOB_RECOVERY_READY_EVENTS,
+    MAX_CLIENT_BLOB_STAGED_BYTES_PER_TRANSACTION, client_blob_hash,
 };
 pub use codec::{ProtocolError, decode_batch, encode};
 pub use inventory::{
@@ -82,8 +82,8 @@ pub use world::{
     MAX_BIOME_NAME_BYTES, MAX_BLOCK_LAYERS, MAX_SUB_CHUNK_REQUESTS, MovePlayerEvent,
     MovePlayerMode, PLAYER_NETWORK_OFFSET, PlayerGameMode, PlayerMovementCorrectionEvent,
     PublisherUpdateEvent, RespawnEvent, SEQUENTIAL_AIR_NETWORK_ID, STANDING_PLAYER_EYE_HEIGHT,
-    SetTimeEvent, SubChunkBatchEvent, SubChunkEntryEvent, SubChunkResult, SubChunkUnavailable,
-    WeatherChannel, WeatherUpdateEvent, WorldBootstrap, WorldEnvironmentBootstrap, WorldEvent,
-    WorldPacketError, air_network_id, into_world_event, request_sub_chunk_column,
-    vanilla_dimension_range,
+    SetTimeEvent, SubChunkBatchEvent, SubChunkEntryEvent, SubChunkReplyAdmissionEvent,
+    SubChunkResult, SubChunkUnavailable, WeatherChannel, WeatherUpdateEvent, WorldBootstrap,
+    WorldEnvironmentBootstrap, WorldEvent, WorldPacketError, air_network_id, into_world_event,
+    request_sub_chunk_column, vanilla_dimension_range,
 };

@@ -296,19 +296,36 @@ impl WorldStream {
             PreparedWorldEvent::BlockUpdates { result, duration } => {
                 self.stats.max_decode_duration = self.stats.max_decode_duration.max(duration);
                 match result {
-                    Ok(prepared) => match self.store.commit_prepared_block_updates(prepared) {
-                        Ok(changed) => {
-                            let now = Instant::now();
-                            for key in changed {
-                                self.refresh_block_entity_visuals_for_sub_chunk(key);
-                                self.sync_resident(key);
-                                self.mark_changed(key, now);
+                    Ok(prepared) => {
+                        let relight = prepared
+                            .iter()
+                            .filter(|mutation| mutation.changed())
+                            .filter_map(|mutation| {
+                                self.block_light_semantics_changed(
+                                    self.store.sub_chunk(mutation.key()).as_deref(),
+                                    mutation.replacement(),
+                                )
+                                .then_some(mutation.key())
+                            })
+                            .collect::<BTreeSet<_>>();
+                        match self.store.commit_prepared_block_updates(prepared) {
+                            Ok(changed) => {
+                                let now = Instant::now();
+                                for key in changed {
+                                    self.refresh_block_entity_visuals_for_sub_chunk(key);
+                                    self.sync_resident(key);
+                                    self.mark_live_mutation_changed(
+                                        key,
+                                        now,
+                                        relight.contains(&key),
+                                    );
+                                }
                             }
+                            Err(_) => self.record_normalization_error(
+                                NormalizationErrorReason::BlockMutationFailure,
+                            ),
                         }
-                        Err(_) => self.record_normalization_error(
-                            NormalizationErrorReason::BlockMutationFailure,
-                        ),
-                    },
+                    }
                     Err(_) => {
                         self.record_normalization_error(
                             NormalizationErrorReason::BlockMutationFailure,
@@ -406,11 +423,15 @@ impl WorldStream {
                     self.record_normalization_error(NormalizationErrorReason::InactiveLevelChunk);
                     return;
                 }
-                let count = event
-                    .requested_sub_chunks
-                    .unwrap_or(range.sub_chunk_count)
-                    .min(range.sub_chunk_count);
-                self.enqueue_request(key, range.base_sub_chunk_y, count, sequence);
+                if let Some(ys) = event.requested_sub_chunk_ys.as_deref() {
+                    self.enqueue_exact_recovery_requests(key, range, ys, sequence);
+                } else {
+                    let count = event
+                        .requested_sub_chunks
+                        .unwrap_or(range.sub_chunk_count)
+                        .min(range.sub_chunk_count);
+                    self.enqueue_request(key, range.base_sub_chunk_y, count, sequence);
+                }
             }
             WorldEvent::BlockUpdates(_) => {
                 unreachable!("block-update batches are prepared on workers")
@@ -635,6 +656,9 @@ impl WorldStream {
                 let _ = self
                     .actors
                     .apply_item_actor(self.actor_session_id, sequence, event);
+            }
+            WorldEvent::SubChunkReplyAdmission(_) => {
+                unreachable!("SubChunk reply admissions commit ordering only")
             }
             WorldEvent::SubChunks(_) => unreachable!("sub-chunk batches are prepared on workers"),
         }

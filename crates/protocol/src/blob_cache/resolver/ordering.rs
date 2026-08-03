@@ -11,12 +11,20 @@ pub(super) fn pending_packet_columns(packet: &PendingPacket) -> Vec<ColumnKey> {
             let SubchunkPacketEntries::SubChunkEntryWithCaching(entries) = &packet.entries else {
                 return Vec::new();
             };
-            stable_unique_columns(entries.iter().map(|entry| ColumnKey {
-                dimension: packet.dimension,
-                x: packet.origin.x.saturating_add(i32::from(entry.dx)),
-                z: packet.origin.z.saturating_add(i32::from(entry.dz)),
-            }))
+            stable_unique_columns(
+                entries
+                    .iter()
+                    .map(|entry| pending_sub_chunk_column(packet, entry.dx, entry.dz)),
+            )
         }
+    }
+}
+
+fn pending_sub_chunk_column(packet: &SubchunkPacket, dx: i8, dz: i8) -> ColumnKey {
+    ColumnKey {
+        dimension: packet.dimension,
+        x: packet.origin.x.saturating_add(i32::from(dx)),
+        z: packet.origin.z.saturating_add(i32::from(dz)),
     }
 }
 

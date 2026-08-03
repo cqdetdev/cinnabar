@@ -30,15 +30,13 @@ pub const OUTBOX_CAPACITY: usize = 32;
 
 /// Origin of a movement sample and the authority allowed to transmit it.
 ///
-/// The safe production default is deliberately non-authoritative. Local
-/// prediction and perspective changes cannot opt in implicitly; Phase 3's
-/// physics authority must be enabled explicitly before samples may enter the
-/// outbound scheduler.
+/// The pre-session default is deliberately non-authoritative. StartGame
+/// selects production physics only after the collision registry and server
+/// anchor are available.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum MovementSource {
     #[default]
     FreeCamera,
-    #[allow(dead_code, reason = "reserved for the Phase 3 physics authority")]
     Physics,
 }
 
@@ -82,7 +80,7 @@ pub(crate) struct PhysicsSendIdentity {
     pub(crate) reanchor_epoch: u64,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PhysicsAuthorityFaultRecord {
     pub session_generation: u64,
     pub fault: PhysicsAuthorityFault,
@@ -282,12 +280,12 @@ impl MovementTicker {
                 expected: self.next_tick,
                 actual: completed.tick,
             };
-            self.fail_physics_authority(fault);
+            self.fail_physics_authority(&fault);
             return Err(fault);
         }
         if self.pending_count() == OUTBOX_CAPACITY {
             let fault = PhysicsAuthorityFault::OutboxOverflow;
-            self.fail_physics_authority(fault);
+            self.fail_physics_authority(&fault);
             return Err(fault);
         }
         if !completed.position.into_iter().all(f32::is_finite)
@@ -298,7 +296,7 @@ impl MovementTicker {
                 .all(f32::is_finite)
         {
             let fault = PhysicsAuthorityFault::InvalidCompletedSample;
-            self.fail_physics_authority(fault);
+            self.fail_physics_authority(&fault);
             return Err(fault);
         }
         let snapshot = self.snapshot(&completed);
@@ -326,11 +324,18 @@ impl MovementTicker {
         Ok(())
     }
 
-    fn fail_physics_authority(&mut self, fault: PhysicsAuthorityFault) {
+    fn fail_physics_authority(&mut self, fault: &PhysicsAuthorityFault) {
         if self.pending_fault.is_none() {
+            bevy::log::warn!(
+                ?fault,
+                session_generation = self.session_generation,
+                next_tick = self.next_tick,
+                pending_count = self.pending_count(),
+                "local physics authority failed closed"
+            );
             self.pending_fault = Some(PhysicsAuthorityFaultRecord {
                 session_generation: self.session_generation,
-                fault,
+                fault: fault.clone(),
                 next_tick: self.next_tick,
                 pending_count: self.pending_count(),
             });
@@ -368,6 +373,15 @@ impl MovementTicker {
 
     pub(crate) const fn physics_is_authorized(&self) -> bool {
         self.session_active && matches!(self.source, MovementSource::Physics)
+    }
+
+    pub(crate) fn enforce_local_physics_authority(
+        &self,
+        local_physics: &mut LocalPhysicsController,
+    ) {
+        if !self.physics_is_authorized() {
+            local_physics.deactivate();
+        }
     }
 
     #[must_use]
@@ -469,7 +483,7 @@ impl MovementTicker {
         }
         if self.tick_evidence.len() == OUTBOX_CAPACITY {
             self.pending_sends.pop_front();
-            self.fail_physics_authority(PhysicsAuthorityFault::OutboxOverflow);
+            self.fail_physics_authority(&PhysicsAuthorityFault::OutboxOverflow);
             return false;
         }
         let pending = self
@@ -502,7 +516,7 @@ impl MovementTicker {
         }
         if !definitely_unsent {
             self.pending_sends.pop_front();
-            self.fail_physics_authority(PhysicsAuthorityFault::IndeterminatePhysicsSend {
+            self.fail_physics_authority(&PhysicsAuthorityFault::IndeterminatePhysicsSend {
                 tick: identity.tick,
             });
             return true;
@@ -519,7 +533,7 @@ impl MovementTicker {
             && pending.sample.session_generation == self.session_generation
             && self.retry_replayed_sample(pending.sample).is_err()
         {
-            self.fail_physics_authority(PhysicsAuthorityFault::OutboxOverflow);
+            self.fail_physics_authority(&PhysicsAuthorityFault::OutboxOverflow);
             return true;
         }
         self.refresh_outbox_reconciliation();
@@ -549,6 +563,11 @@ impl MovementTicker {
         self.physics_is_authorized()
             && !self.terminal_drain
             && !self.has_unresolved_position_authority_change()
+    }
+    pub(crate) fn can_advance_physics_frame(&self) -> bool {
+        self.accepting_physics_admissions()
+            && self.pending_count()
+                <= OUTBOX_CAPACITY.saturating_sub(MAX_LOCAL_PHYSICS_TICKS_PER_FRAME)
     }
 
     /// Records the explicit event that the server-authoritative local position
@@ -694,8 +713,8 @@ impl MovementTicker {
     }
 
     #[must_use]
-    pub(crate) const fn pending_authority_fault(&self) -> Option<PhysicsAuthorityFaultRecord> {
-        self.pending_fault
+    pub(crate) fn pending_authority_fault(&self) -> Option<&PhysicsAuthorityFaultRecord> {
+        self.pending_fault.as_ref()
     }
 
     #[cfg(test)]
@@ -704,7 +723,7 @@ impl MovementTicker {
     }
 
     pub(crate) fn record_physics_fault(&mut self, fault: PhysicsAuthorityFault) {
-        self.fail_physics_authority(fault);
+        self.fail_physics_authority(&fault);
     }
 
     fn apply_correction_plan(
@@ -827,49 +846,74 @@ pub fn reconcile_candidate_physics_correction(
     if !ticker.physics_is_authorized() {
         return Err(PhysicsAuthorityFault::Unauthorized);
     }
-    let aligned_tick = match mode {
-        PhysicsCorrectionMode::ReplayIfRetained => tick,
-        PhysicsCorrectionMode::Snap => ticker
-            .next_tick
-            .max(tick.saturating_add(1))
-            .saturating_sub(1),
-    };
-    let mut candidate_physics = physics.clone();
-    let mut candidate_ticker = ticker.clone();
-    let confirmation = candidate_ticker.sent_confirmation(aligned_tick);
-    let plan = candidate_physics
-        .apply_correction(
-            network_position,
-            aligned_tick,
-            on_ground,
-            mode,
-            confirmation.as_ref(),
-            world,
-        )
-        .map_err(|error| match error {
-            physics::PhysicsCorrectionError::InvalidAnchor
-            | physics::PhysicsCorrectionError::ReplayFailed => {
-                PhysicsAuthorityFault::CorrectionReplayFailed
-            }
-            physics::PhysicsCorrectionError::NotRetained { tick } => {
-                PhysicsAuthorityFault::CorrectionNotRetained { tick }
-            }
-            physics::PhysicsCorrectionError::WorldIdentityMismatch { tick } => {
-                PhysicsAuthorityFault::ReplayWorldIdentityMismatch { tick }
-            }
-        });
-    let result = plan.and_then(|plan| {
+
+    let apply_candidate = |mode| {
+        let aligned_tick = match mode {
+            PhysicsCorrectionMode::ReplayIfRetained => tick,
+            PhysicsCorrectionMode::Snap => ticker
+                .next_tick
+                .max(tick.saturating_add(1))
+                .saturating_sub(1),
+        };
+        let mut candidate_physics = physics.clone();
+        let mut candidate_ticker = ticker.clone();
+        let confirmation = candidate_ticker.sent_confirmation(aligned_tick);
+        let plan = candidate_physics
+            .apply_correction(
+                network_position,
+                aligned_tick,
+                on_ground,
+                mode,
+                confirmation.as_ref(),
+                world,
+            )
+            .map_err(|error| match error {
+                physics::PhysicsCorrectionError::InvalidAnchor
+                | physics::PhysicsCorrectionError::ReplayFailed => {
+                    PhysicsAuthorityFault::CorrectionReplayFailed
+                }
+                physics::PhysicsCorrectionError::NotRetained { tick } => {
+                    PhysicsAuthorityFault::CorrectionNotRetained { tick }
+                }
+                physics::PhysicsCorrectionError::WorldIdentityMismatch { tick } => {
+                    PhysicsAuthorityFault::ReplayWorldIdentityMismatch { tick }
+                }
+            })?;
         candidate_ticker.apply_correction_plan(&plan)?;
-        let outcome = plan.outcome;
-        *physics = candidate_physics;
-        *ticker = candidate_ticker;
-        Ok(outcome)
-    });
-    if let Err(fault) = result {
-        ticker.fail_physics_authority(fault);
-        physics.deactivate();
+        Ok((candidate_ticker, candidate_physics, plan.outcome))
+    };
+
+    let mut result = apply_candidate(mode);
+    if matches!(mode, PhysicsCorrectionMode::ReplayIfRetained)
+        && matches!(
+            result,
+            Err(PhysicsAuthorityFault::CorrectionNotRetained { .. }
+                | PhysicsAuthorityFault::CorrectionReplayFailed
+                | PhysicsAuthorityFault::ReplayWorldIdentityMismatch { .. }
+                | PhysicsAuthorityFault::PendingWorldIdentityMismatch { .. })
+        )
+    {
+        // A delayed correction can outlive local history, and replaying from a
+        // changed anchor or after a newly committed subchunk can legitimately
+        // encounter different immutable chunk revisions. The server position
+        // remains authoritative in each case, so discard speculative history
+        // and continue from a current-tick snap instead of silently restoring
+        // free-camera movement.
+        result = apply_candidate(PhysicsCorrectionMode::Snap);
     }
-    result
+
+    match result {
+        Ok((candidate_ticker, candidate_physics, outcome)) => {
+            *physics = candidate_physics;
+            *ticker = candidate_ticker;
+            Ok(outcome)
+        }
+        Err(fault) => {
+            ticker.fail_physics_authority(&fault);
+            physics.deactivate();
+            Err(fault)
+        }
+    }
 }
 
 pub(crate) fn flush_player_auth_inputs<E>(
@@ -893,7 +937,7 @@ pub(crate) fn flush_player_auth_inputs<E>(
     let mut sent = 0;
     for _ in 0..budget {
         if ticker.tick_evidence.len() == OUTBOX_CAPACITY {
-            ticker.fail_physics_authority(PhysicsAuthorityFault::OutboxOverflow);
+            ticker.fail_physics_authority(&PhysicsAuthorityFault::OutboxOverflow);
             break;
         }
         let Some(sample) = ticker.pop_pending() else {
@@ -923,60 +967,7 @@ pub(crate) fn flush_player_auth_inputs<E>(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn flush_refuses_a_stale_queue_without_physics_authority() {
-        let mut ticker = MovementTicker::default();
-        ticker.reset(1, 10, [0.0; 3]);
-        ticker.set_source(MovementSource::Physics);
-        ticker
-            .enqueue_completed_physics(PhysicsMovementSample {
-                tick: 11,
-                position: [1.0, 2.0, 3.0],
-                move_vector: [0.0; 2],
-                pitch: 0.0,
-                yaw: 0.0,
-                head_yaw: 0.0,
-                camera_orientation: [0.0, 0.0, 1.0],
-                jumping: false,
-                sneaking: false,
-                sprinting: false,
-                input_mode: PlayerInputMode::Mouse,
-                grounded_before_tick: false,
-
-                grounded_after_tick: false,
-                jump_repeated: false,
-                world_identity: WorldCollisionIdentity::new(
-                    sim::CollisionRegistryIdentity {
-                        protocol: 1001,
-                        id_space: sim::CollisionIdSpace::Sequential,
-                        preg_sha256: [1; 32],
-                    },
-                    [],
-                )
-                .unwrap(),
-            })
-            .unwrap();
-        assert_eq!(ticker.outbox.len(), 1);
-
-        // Simulate stale state surviving a future refactor so the flush guard
-        // is verified independently from set_source's transition cleanup.
-        ticker.source = MovementSource::FreeCamera;
-        let mut sent_packets = 0;
-        let flushed = flush_player_auth_inputs(&mut ticker, 8, None, |_identity, _packet| {
-            sent_packets += 1;
-            Ok::<_, ()>(())
-        })
-        .unwrap();
-
-        assert_eq!(flushed, 0);
-        assert_eq!(sent_packets, 0);
-        assert_eq!(ticker.sent_free_camera_packet_count(), 0);
-        assert_eq!(ticker.outbox.len(), 1);
-    }
-}
+mod tests;
 
 #[cfg(test)]
 mod correction_tests;

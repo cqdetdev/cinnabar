@@ -228,6 +228,20 @@ fn auto_fly_keeps_the_mutation_target_in_view() {
     }
 }
 
+#[test]
+fn stable_presentation_pause_resumes_only_an_enabled_auto_fly_path() {
+    let mut enabled = AutoFly::new(true);
+    enabled.pause_for_stable_presentation();
+    assert!(!enabled.enabled());
+    enabled.resume_after_stable_presentation();
+    assert!(enabled.enabled());
+
+    let mut disabled = AutoFly::new(false);
+    disabled.pause_for_stable_presentation();
+    disabled.resume_after_stable_presentation();
+    assert!(!disabled.enabled());
+}
+
 fn axes_for(key: KeyCode) -> Vec3 {
     let mut keys = ButtonInput::default();
     keys.press(key);
@@ -298,13 +312,13 @@ fn capture_test_app(
     focused: bool,
     grab_mode: CursorGrabMode,
     visible: bool,
-    auto_fly: bool,
+    capture_on_start: bool,
 ) -> (App, Entity) {
     let mut app = App::new();
     app.init_resource::<ButtonInput<KeyCode>>()
         .init_resource::<ButtonInput<MouseButton>>()
         .init_resource::<AccumulatedMouseMotion>()
-        .insert_resource(AutoFly::new(auto_fly))
+        .insert_resource(AutoFly::with_startup_capture(false, capture_on_start))
         .add_systems(Update, camera::update_cursor_capture);
 
     let entity = app
@@ -323,6 +337,18 @@ fn capture_test_app(
         ))
         .id();
     (app, entity)
+}
+
+#[test]
+fn candidate_startup_capture_locks_input_without_enabling_auto_fly() {
+    let (mut app, window) = capture_test_app(true, CursorGrabMode::None, true, true);
+
+    app.update();
+
+    let cursor = app.world().get::<CursorOptions>(window).unwrap();
+    assert_eq!(cursor.grab_mode, CursorGrabMode::Locked);
+    assert!(!cursor.visible);
+    assert!(!app.world().resource::<AutoFly>().enabled());
 }
 
 #[test]
@@ -567,51 +593,49 @@ fn plugin_spawns_camera_and_auto_fly_uses_delta_seconds() {
 }
 
 #[test]
-fn acceptance_auto_fly_waits_for_world_ready_before_changing_visibility() {
+fn stable_presentation_pause_ignores_held_movement_and_look_input() {
     let mut app = App::new();
+    configure_client_frame_schedule(&mut app);
     app.init_resource::<Time>()
-        .insert_resource(crate::acceptance::AcceptanceRun::new(
-            Some(60),
-            None,
-            false,
-            false,
-        ))
-        .add_plugins(FlyCameraPlugin::new(true));
+        .add_plugins(FlyCameraPlugin::new(true))
+        .add_systems(
+            Update,
+            (
+                collect_raw_input.in_set(ClientFrameSet::RawInput),
+                route_semantic_input.in_set(ClientFrameSet::SemanticSample),
+                finalize_semantic_input_after_ui_authority.in_set(ClientFrameSet::SemanticFinalize),
+            ),
+        );
     app.world_mut().spawn((
         Window {
             focused: true,
             ..default()
         },
-        CursorOptions::default(),
+        CursorOptions {
+            grab_mode: CursorGrabMode::Locked,
+            visible: false,
+            ..default()
+        },
         PrimaryWindow,
     ));
-
     app.update();
-    let start = app.world().resource::<LocalViewPose>().eye_translation();
+    let frozen = *app.world().resource::<LocalViewPose>();
+
+    app.world_mut()
+        .resource_mut::<AutoFly>()
+        .pause_for_stable_presentation();
+    app.world_mut()
+        .resource_mut::<ButtonInput<KeyCode>>()
+        .press(KeyCode::KeyW);
+    app.world_mut()
+        .resource_mut::<AccumulatedMouseMotion>()
+        .delta = Vec2::new(15.0, -4.0);
     app.world_mut()
         .resource_mut::<Time>()
         .advance_by(Duration::from_secs_f32(0.5));
     app.update();
-    assert_eq!(
-        app.world().resource::<LocalViewPose>().eye_translation(),
-        start,
-        "pre-ready acceptance motion keeps invalidating the exact presentation snapshot"
-    );
 
-    app.world_mut()
-        .resource_mut::<crate::acceptance::AcceptanceRun>()
-        .world_ready = true;
-    app.world_mut()
-        .resource_mut::<Time>()
-        .advance_by(Duration::from_secs_f32(0.5));
-    app.update();
-    let expected = start + camera::auto_fly_offset(0.5);
-    assert!(
-        app.world()
-            .resource::<LocalViewPose>()
-            .eye_translation()
-            .abs_diff_eq(expected, 1.0e-4)
-    );
+    assert_eq!(*app.world().resource::<LocalViewPose>(), frozen);
 }
 
 #[test]

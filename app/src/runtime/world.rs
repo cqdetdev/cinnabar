@@ -16,13 +16,14 @@ use bevy::{
     time::Real,
 };
 use client_world::{
-    CommittedControlEvent, CommittedUiEvent, WorldMeshChange, WorldStream, WorldStreamPoll,
+    CommittedControlEvent, CommittedUiEvent, ViewCohortStatus, WorldMeshChange, WorldStream,
+    WorldStreamPoll,
 };
 use meshing::CameraMedium;
 use protocol::{BlobCacheStats, PLAYER_NETWORK_OFFSET};
 use render::{
     ChunkBiomeTints, ChunkRenderQueue, ChunkUploadAcknowledgements, ChunkUploadBudget,
-    ChunkUploadPriority, ChunkUploadToken,
+    ChunkUploadPriority, ChunkUploadToken, RuntimeStage, RuntimeStageProfiler,
 };
 
 use crate::{
@@ -72,7 +73,10 @@ pub(crate) fn acceptance_surface_maximum_y(network_position: [f32; 3]) -> Option
 }
 
 #[derive(Resource, Debug, Default)]
-pub(crate) struct WorldStreamFramePoll(pub(crate) WorldStreamPoll);
+pub(crate) struct WorldStreamFramePoll {
+    pub(crate) report: WorldStreamPoll,
+    pub(crate) cohort: Option<ViewCohortStatus>,
+}
 
 #[derive(Resource)]
 pub(crate) struct ClientWorld {
@@ -340,15 +344,18 @@ pub(crate) fn reconcile_world_stream_before_physics(
         ..
     } = &mut *client_world;
     let Some(stream) = stream.as_mut() else {
-        frame_poll.0 = WorldStreamPoll::default();
+        *frame_poll = WorldStreamFramePoll::default();
         local_frame.reset(LocalPlayerFrameReset::Session);
         interaction.invalidate();
         return;
     };
-    frame_poll.0 = stream.poll(
+    frame_poll.report = stream.poll(
         view.eye_translation().to_array(),
         upload_budget.max_per_frame,
     );
+    frame_poll.cohort = stream
+        .committed_view_cohort()
+        .map(|target| stream.cohort_status(target));
     let controls = stream.take_committed_controls();
     if let Some(error) = stream.take_fatal_error() {
         movement.deactivate();
@@ -379,7 +386,7 @@ pub(crate) fn reconcile_world_stream_before_physics(
                     let previous = local_physics
                         .network_position()
                         .unwrap_or(resolved.position);
-                    if let Ok(outcome) = reconcile_candidate_physics_correction(
+                    match reconcile_candidate_physics_correction(
                         &mut movement,
                         &mut local_physics,
                         resolved.position,
@@ -388,10 +395,15 @@ pub(crate) fn reconcile_world_stream_before_physics(
                         PhysicsCorrectionMode::ReplayIfRetained,
                         &world,
                     ) {
-                        phase3_evidence.note_correction(
+                        Ok(outcome) => phase3_evidence.note_correction(
                             outcome,
                             position_distance(previous, resolved.position),
-                        );
+                        ),
+                        Err(fault) => warn!(
+                            ?fault,
+                            correction_tick = correction.tick,
+                            "local physics authority failed while applying a server correction"
+                        ),
                     }
                 } else {
                     movement.snap_non_authoritative_anchor(correction.tick, resolved.position);
@@ -517,6 +529,7 @@ pub(crate) fn reconcile_world_stream_before_physics(
                 unreachable!("environment-only controls return before spatial reconciliation")
             }
         };
+        movement.enforce_local_physics_authority(&mut local_physics);
         local_frame.reset(reset);
         interaction.invalidate();
         let _ = acceptance.observe_committed_full_view_control(&control);
@@ -548,7 +561,11 @@ pub(crate) fn drive_world_stream(
     mut publication: ResMut<PublicationController>,
     mut view: ResMut<LocalViewPose>,
     mut frame_poll: ResMut<WorldStreamFramePoll>,
+    profiler: Option<Res<RuntimeStageProfiler>>,
 ) {
+    let _timer = profiler
+        .as_deref()
+        .map(|profiler| profiler.time(RuntimeStage::WorldStream));
     let AppWorldState {
         mut client_world,
         clock,
@@ -562,11 +579,9 @@ pub(crate) fn drive_world_stream(
         return;
     };
     synchronize_biome_tints(stream, &mut biome_tints);
+    let mutation_cohort = frame_poll.cohort;
     for acknowledgement in acknowledgements.drain() {
         render_queue.record_gpu_upload_bytes(acknowledgement.uploaded_bytes);
-        let mutation_cohort = stream
-            .committed_view_cohort()
-            .map(|target| stream.cohort_status(target));
         if let Some(latency) = acceptance.acknowledge_mutation(
             acknowledgement.key,
             acknowledgement.token.generation,
@@ -584,7 +599,7 @@ pub(crate) fn drive_world_stream(
         );
     }
     let committed_ui = stream.take_committed_ui();
-    let poll_report = std::mem::take(&mut frame_poll.0);
+    let poll_report = std::mem::take(&mut frame_poll.report);
     let local_millis = u64::try_from(time.elapsed().as_millis()).unwrap_or(u64::MAX);
     for committed in committed_ui {
         let result = match committed {
@@ -669,7 +684,6 @@ pub(crate) fn drive_world_stream(
     let mut published_items = 0_usize;
     let mut published_payload_items = 0_usize;
     let mut published_bytes = 0_u64;
-    let mut published_zero_byte_operations = 0_usize;
     if let Some(stream) = client_world.stream.as_mut() {
         while let Some(change) = stream.pop_mesh_change() {
             if !mesh_change_has_publication_permit(&change) {
@@ -700,6 +714,7 @@ pub(crate) fn drive_world_stream(
                     tint_identity,
                     generation,
                     dirty_since,
+                    urgent,
                     permit,
                 } => {
                     let diagnostic_geometry = mesh.diagnostic_geometry().clone();
@@ -710,7 +725,11 @@ pub(crate) fn drive_world_stream(
                         mesh,
                         biome,
                         tint_identity,
-                        ChunkUploadPriority::from_camera(key, camera_position),
+                        if urgent {
+                            ChunkUploadPriority::urgent()
+                        } else {
+                            ChunkUploadPriority::from_camera(key, camera_position)
+                        },
                         ChunkUploadToken {
                             generation,
                             dirty_since,
@@ -728,6 +747,7 @@ pub(crate) fn drive_world_stream(
                             tint_identity,
                             generation,
                             dirty_since,
+                            urgent,
                             permit: Some(permit),
                         }),
                     }
@@ -736,13 +756,18 @@ pub(crate) fn drive_world_stream(
                     key,
                     generation,
                     dirty_since,
+                    urgent,
                     permit,
                 } => {
                     let publication_permit =
                         permit.expect("publication permit was validated before render handoff");
                     match render_queue.try_remove_tracked_permitted(
                         key,
-                        ChunkUploadPriority::from_camera(key, camera_position),
+                        if urgent {
+                            ChunkUploadPriority::urgent()
+                        } else {
+                            ChunkUploadPriority::from_camera(key, camera_position)
+                        },
                         ChunkUploadToken {
                             generation,
                             dirty_since,
@@ -757,6 +782,7 @@ pub(crate) fn drive_world_stream(
                             key,
                             generation,
                             dirty_since,
+                            urgent,
                             permit: Some(permit),
                         }),
                     }
@@ -764,10 +790,7 @@ pub(crate) fn drive_world_stream(
             };
             let Some(retry) = retry else {
                 published_items = published_items.saturating_add(1);
-                if change_bytes == 0 {
-                    published_zero_byte_operations =
-                        published_zero_byte_operations.saturating_add(1);
-                } else {
+                if change_bytes != 0 {
                     published_payload_items = published_payload_items.saturating_add(1);
                     published_bytes = published_bytes.saturating_add(change_bytes);
                 }
@@ -806,6 +829,7 @@ pub(crate) fn drive_world_stream(
         // starts after this anchor, so it must remain eligible for simulation.
         movement.reanchor_surface_spawn(tick, position);
         local_physics.reanchor_network_position(position, tick, true);
+        movement.enforce_local_physics_authority(&mut local_physics);
         client_world.pending_surface_spawn = None;
         info!(position = ?position, "resolved temporary Bedrock spawn from packed terrain");
     }

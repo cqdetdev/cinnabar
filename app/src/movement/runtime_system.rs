@@ -1,5 +1,9 @@
 use std::time::Instant;
 
+use crate::{
+    acceptance::AcceptanceRun, camera::AutoFly, local_player::LocalViewPose,
+    runtime::world::ClientWorld, semantic_controls::SemanticInputSnapshot,
+};
 use bevy::{
     log::debug,
     prelude::{EulerRot, Local, Res, ResMut, Time, Vec3},
@@ -8,11 +12,7 @@ use bevy::{
 use protocol::PlayerInputMode;
 use semantic_input::Action;
 
-use crate::{
-    acceptance::AcceptanceRun, camera::AutoFly, local_player::LocalViewPose,
-    runtime::world::ClientWorld, semantic_controls::SemanticInputSnapshot,
-};
-
+use super::physics::is_transient_collision_unavailability;
 use super::{
     LocalPhysicsController, MovementTicker, PhysicsAuthorityFault, PhysicsCollisionRegistries,
     PhysicsSampleContext, physics_movement_input,
@@ -37,7 +37,7 @@ pub(crate) fn advance_local_physics(
     if auto_fly.enabled() || !physics.is_active() {
         return;
     }
-    if !movement_ticker.accepting_physics_admissions() {
+    if !movement_ticker.can_advance_physics_frame() {
         return;
     }
     let Some(stream) = client_world.stream.as_ref() else {
@@ -80,16 +80,19 @@ pub(crate) fn advance_local_physics(
         &world,
     );
     let blocker = frame.blocked.as_ref().map(ToString::to_string);
+    let authority_fault = physics_authority_fault_for_frame(&frame);
     if blocker != *previous_blocker {
-        if let Some(blocker) = blocker.as_deref() {
+        if authority_fault.is_none()
+            && let Some(blocker) = blocker.as_deref()
+        {
             debug!(%blocker, "local physics is waiting for authoritative collision data");
         }
         *previous_blocker = blocker;
     }
-    if frame.dropped_ticks != 0 && movement_ticker.physics_is_authorized() {
-        movement_ticker.record_physics_fault(PhysicsAuthorityFault::PhysicsTickOverflow {
-            dropped: frame.dropped_ticks,
-        });
+    if let Some(fault) = authority_fault
+        && movement_ticker.physics_is_authorized()
+    {
+        movement_ticker.record_physics_fault(fault);
         physics.deactivate();
         return;
     }
@@ -103,4 +106,29 @@ pub(crate) fn advance_local_physics(
     if let Some(position) = physics.render_eye_position() {
         view.set_eye_translation(Vec3::from_array(position));
     }
+}
+
+pub(crate) fn physics_authority_fault_for_frame(
+    frame: &super::LocalPhysicsFrame,
+) -> Option<PhysicsAuthorityFault> {
+    if frame
+        .blocked
+        .as_ref()
+        .is_some_and(is_transient_collision_unavailability)
+    {
+        return None;
+    }
+    if frame.dropped_ticks != 0 {
+        return Some(PhysicsAuthorityFault::PhysicsTickOverflow {
+            due: frame.due_ticks,
+            dropped: frame.dropped_ticks,
+        });
+    }
+
+    let error = frame.blocked.as_ref()?;
+    Some(PhysicsAuthorityFault::PhysicsSimulationError {
+        due: frame.due_ticks,
+        tick_index: frame.blocked_tick_index.unwrap_or(frame.completed_ticks),
+        error: error.clone(),
+    })
 }

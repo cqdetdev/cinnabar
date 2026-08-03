@@ -20,6 +20,15 @@ const LOCAL_PHYSICS_HISTORY_CAPACITY: usize = 32;
 /// catch-up spike. Outbound movement remains independently disabled.
 pub const MAX_LOCAL_PHYSICS_TICKS_PER_FRAME: usize = 8;
 
+pub(crate) fn is_transient_collision_unavailability(error: &SimulationError) -> bool {
+    matches!(
+        error,
+        SimulationError::World(
+            sim::WorldQueryError::UnloadedChunk(_) | sim::WorldQueryError::UnknownRuntimeId { .. }
+        )
+    )
+}
+
 /// Converts app right/forward axes into bedsim's left-positive strafe input.
 #[must_use]
 pub fn physics_movement_input(
@@ -259,8 +268,10 @@ pub(super) struct PhysicsCorrectionPlan {
 
 #[derive(Debug, Default)]
 pub struct LocalPhysicsFrame {
+    pub due_ticks: u64,
     pub completed_ticks: usize,
     pub dropped_ticks: u64,
+    pub blocked_tick_index: Option<usize>,
     pub blocked: Option<SimulationError>,
     pub samples: Vec<PhysicsMovementSample>,
 }
@@ -419,6 +430,7 @@ impl LocalPhysicsController {
         self.accumulated_seconds -= due as f64 * LOCAL_PHYSICS_TICK_SECONDS;
         let allowed = due.min(MAX_LOCAL_PHYSICS_TICKS_PER_FRAME as u64) as usize;
         let mut frame = LocalPhysicsFrame {
+            due_ticks: due,
             dropped_ticks: due.saturating_sub(allowed as u64),
             samples: Vec::with_capacity(allowed),
             ..LocalPhysicsFrame::default()
@@ -477,11 +489,30 @@ impl LocalPhysicsController {
                     input.jump_pressed = false;
                 }
                 Err(error) => {
-                    self.previous_position = state.position;
-                    self.accumulated_seconds = 0.0;
-                    frame.dropped_ticks = frame
-                        .dropped_ticks
-                        .saturating_add((allowed - tick_index) as u64);
+                    let transient_collision_blocked = matches!(
+                        &error,
+                        sim::PredictionError::Simulation(error)
+                            if is_transient_collision_unavailability(error)
+                    );
+                    if transient_collision_blocked {
+                        // Prediction is transactional: the failed tick did
+                        // not mutate state or history. Discard all elapsed
+                        // time in this blocked frame instead of retaining a
+                        // retry backlog that could become a false overflow
+                        // or a large catch-up burst when collision data
+                        // returns. New elapsed time starts a fresh tick.
+                        self.previous_position = state.position;
+                        self.accumulated_seconds = 0.0;
+                        frame.dropped_ticks = 0;
+                    } else {
+                        // Keep a failed non-transient tick pending. The
+                        // existing overflow count remains authoritative for
+                        // genuine overload with usable collision data.
+                        let unconsumed_ticks = allowed - tick_index;
+                        self.accumulated_seconds +=
+                            unconsumed_ticks as f64 * LOCAL_PHYSICS_TICK_SECONDS;
+                    }
+                    frame.blocked_tick_index = Some(tick_index);
                     frame.blocked = Some(match error {
                         sim::PredictionError::Simulation(error) => error,
                         sim::PredictionError::ZeroCapacity
@@ -536,9 +567,10 @@ impl LocalPhysicsController {
         if tick > current_tick {
             return Err(PhysicsCorrectionError::NotRetained { tick });
         }
-        if self.history.state_at(tick).is_none()
-            || !self.sample_history.iter().any(|sample| sample.tick == tick)
-        {
+        let Some(mut corrected) = self.history.state_at(tick).cloned() else {
+            return Err(PhysicsCorrectionError::NotRetained { tick });
+        };
+        if !self.sample_history.iter().any(|sample| sample.tick == tick) {
             return Err(PhysicsCorrectionError::NotRetained { tick });
         }
 
@@ -547,8 +579,12 @@ impl LocalPhysicsController {
             f64::from(network_position[1] - PLAYER_NETWORK_OFFSET),
             f64::from(network_position[2]),
         );
-        let mut corrected = PlayerState::new(feet);
-        corrected.tick = tick;
+        // CorrectPlayerMovePrediction replaces the retained position at one
+        // tick, then requires movement after that tick to be replayed from the
+        // corrected anchor. It does not supply a replacement velocity. Keep
+        // the retained dynamic state so a confirmation or small correction
+        // cannot restart acceleration from rest.
+        corrected.position = feet;
         corrected.on_ground = on_ground;
         // Axis collisions describe the motion that produced a position, so they
         // cannot be recomputed from a corrected anchor. They are retained only
@@ -561,12 +597,13 @@ impl LocalPhysicsController {
         // an established vanilla or protocol guarantee. Retaining the flags
         // avoids stuttering a legitimate wall climb on matching corrections.
         // Any missing proof or mismatch clears the flags and keeps the discrete
-        // climb branch closed. Identity query failure is semantic
-        // unavailability, so it clears these optional flags without
-        // disconnecting. The position comparison is exact in the sent `f32`
-        // network space because that is the serialized position available to
-        // compare. The loss is bounded to the first replayed tick:
-        // `Simulator::tick` re-derives collisions for every tick after it.
+        // climb branch closed. An upward velocity produced while a stale
+        // horizontal collision was retained is the same unconfirmed ladder
+        // response, so it is cleared with those flags. Identity query failure
+        // is semantic unavailability and does not disconnect. The position
+        // comparison is exact in the sent `f32` network space because that is
+        // the serialized position available to compare. The loss is bounded
+        // to the corrected tick: `Simulator::tick` re-derives collisions.
         let retained_sample = self
             .sample_history
             .iter()
@@ -579,13 +616,12 @@ impl LocalPhysicsController {
                 && collision_identity_is_current(world, feet, &confirmation.world_identity)
                     .unwrap_or(false)
         });
-        corrected.collisions = if server_confirmed_prediction {
-            self.history
-                .state_at(tick)
-                .map_or_else(sim::AxisCollisions::default, |retained| retained.collisions)
-        } else {
-            sim::AxisCollisions::default()
-        };
+        if !server_confirmed_prediction {
+            if (corrected.collisions.x || corrected.collisions.z) && corrected.velocity.y > 0.0 {
+                corrected.velocity.y = 0.0;
+            }
+            corrected.collisions = sim::AxisCollisions::default();
+        }
         let (replay, replayed_ticks) = self
             .history
             .rewind_and_replay_traced(

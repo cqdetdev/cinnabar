@@ -23,6 +23,9 @@ $projectRoot = (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path
 . (Join-Path $PSScriptRoot 'Phase3Launch.ps1')
 . (Join-Path $PSScriptRoot 'Load.ps1')
 
+$Target = ConvertTo-Phase3Target -Target $Target
+$Scenario = ConvertTo-Phase3Scenario -Scenario $Scenario
+
 Assert-Phase3CleanTrackedSource -ProjectRoot $projectRoot
 $buildCommit = (& git -C $projectRoot rev-parse HEAD).Trim()
 if ($LASTEXITCODE -ne 0 -or $buildCommit -cnotmatch '^[0-9a-f]{40}$') {

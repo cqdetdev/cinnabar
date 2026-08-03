@@ -16,7 +16,8 @@ use client_world::{SAFE_SERVER_HEIGHT, WorldStream};
 use protocol::WorldEvent;
 use render::{
     ActorCullView, ActorMainWitness, ActorRenderFrame, ActorRenderScene, ActorRuntimeWitness,
-    ChunkUploadAcknowledgements, MAX_ACTOR_RENDER_DISTANCE_BLOCKS,
+    ChunkUploadAcknowledgements, MAX_ACTOR_RENDER_DISTANCE_BLOCKS, RuntimeStage,
+    RuntimeStageProfiler,
 };
 #[cfg(test)]
 use render::{ActorRenderSource, ActorSkinPixels};
@@ -246,7 +247,11 @@ pub(crate) fn receive_network_events(
     model_witness_source: Res<ModelWitnessFileSource>,
     publication: Res<PublicationController>,
     local_player: NetworkLocalPlayerState,
+    profiler: Option<Res<RuntimeStageProfiler>>,
 ) {
+    let _timer = profiler
+        .as_deref()
+        .map(|profiler| profiler.time(RuntimeStage::NetworkIngestion));
     let NetworkLocalPlayerState {
         mut view,
         mut avatar,
@@ -370,19 +375,18 @@ pub(crate) fn receive_network_events(
                     initial_tick,
                     false,
                 );
-                match physics_authority.authorize(auto_fly.enabled(), collisions.is_complete()) {
-                    Ok(source) => {
-                        movement.set_source(source);
-                        info!(?source, "selected player movement authority");
-                    }
-                    Err(fault) => {
-                        movement.set_source(MovementSource::FreeCamera);
-                        local_physics.deactivate();
-                        record_fatal_error(
-                            &mut client_world.fatal_error,
-                            format!("player Physics authority failed closed: {fault:?}"),
-                        );
-                    }
+                if let Err(fault) = physics_authority.apply_start_game(
+                    auto_fly.enabled(),
+                    collisions.is_complete(),
+                    &mut movement,
+                    &mut local_physics,
+                ) {
+                    movement.set_source(MovementSource::FreeCamera);
+                    local_physics.deactivate();
+                    record_fatal_error(
+                        &mut client_world.fatal_error,
+                        format!("player Physics authority failed closed: {fault:?}"),
+                    );
                 }
                 client_world.pending_surface_spawn = resolved.surface_anchor;
                 client_world.stream = Some(stream);
@@ -531,7 +535,10 @@ pub(crate) fn receive_network_events(
     );
     for ingress in events {
         let sequenced = match ingress {
-            session::WorldIngress::Event(sequenced) => sequenced,
+            session::WorldIngress::Event(sequenced) => {
+                network.record_readiness_event_consumed(&sequenced.event);
+                sequenced
+            }
             session::WorldIngress::FastTransferBarrier {
                 session_generation,
                 sequence,

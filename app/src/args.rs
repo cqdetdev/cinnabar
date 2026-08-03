@@ -429,6 +429,8 @@ mod tests {
             "--require-transparent-presentation",
             "--transparent-witness-request",
             "--model-witness-request",
+            "--phase3-evidence-target",
+            "--phase3-candidate-physics",
         ] {
             assert!(HELP.contains(flag));
         }
@@ -461,6 +463,17 @@ mod tests {
         assert!(matches!(
             ClientArgs::parse_from(["client", "--phase3-candidate-physics"]),
             Err(ArgsError::Unknown(_))
+        ));
+        assert!(matches!(
+            ClientArgs::parse_from([
+                "client",
+                "--acceptance-seconds",
+                "30",
+                "--phase3-evidence-target",
+                "Lunar",
+                "--phase3-candidate-physics"
+            ]),
+            Err(ArgsError::Phase3EvidenceRequiresAttributableRun)
         ));
         assert!(matches!(
             ClientArgs::parse_from(["client", "--phase3-evidence-target", "Unknown"]),

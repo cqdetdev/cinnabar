@@ -19,7 +19,52 @@ fn production_physics_authority_is_default_complete_and_auto_fly_safe() {
 }
 
 #[test]
-fn default_free_camera_never_enqueues_or_sends_after_start_game_and_correction() {
+fn production_start_game_activates_physics_authority() {
+    let mut movement = MovementTicker::default();
+    movement.reset(7, 100, [8.0, 72.62, -4.0]);
+    let mut local_physics = LocalPhysicsController::default();
+    local_physics.reanchor_network_position([8.0, 72.62, -4.0], 100, false);
+
+    assert_eq!(
+        PhysicsAuthorityGate::ProductionEnabled.apply_start_game(
+            false,
+            true,
+            &mut movement,
+            &mut local_physics,
+        ),
+        Ok(MovementSource::Physics)
+    );
+    assert_eq!(movement.source(), MovementSource::Physics);
+    assert!(local_physics.is_active());
+}
+
+#[test]
+fn auto_fly_authority_deactivates_prepared_and_reanchored_local_physics() {
+    let mut movement = MovementTicker::default();
+    let mut local_physics = LocalPhysicsController::default();
+    local_physics.reanchor_network_position([8.0, 72.62, -4.0], 100, false);
+    assert!(local_physics.is_active());
+
+    assert_eq!(
+        PhysicsAuthorityGate::ProductionEnabled.apply_start_game(
+            true,
+            true,
+            &mut movement,
+            &mut local_physics,
+        ),
+        Ok(MovementSource::FreeCamera)
+    );
+    assert_eq!(movement.source(), MovementSource::FreeCamera);
+    assert!(!local_physics.is_active());
+
+    local_physics.reanchor_network_position([9.0, 73.62, -3.0], 101, true);
+    movement.snap_non_authoritative_anchor(101, [9.0, 73.62, -3.0]);
+    movement.enforce_local_physics_authority(&mut local_physics);
+    assert!(!local_physics.is_active());
+}
+
+#[test]
+fn free_camera_never_enqueues_or_sends_after_start_game_and_correction() {
     let mut ticker = MovementTicker::default();
     ticker.reset(7, 1_000, [1.0, 64.0, 2.0]);
     assert_eq!(
@@ -214,6 +259,26 @@ fn outbox_is_bounded_and_session_reset_discards_stale_ticks_and_input_edges() {
         Err(PhysicsAuthorityFault::Unauthorized)
     );
     assert_eq!(ticker.pending_count(), 0);
+}
+
+#[test]
+fn physics_frame_admission_reserves_the_maximum_fixed_tick_batch() {
+    let mut ticker = MovementTicker::default();
+    ticker.reset(1, 0, [0.0; 3]);
+    ticker.set_source(MovementSource::Physics);
+    let reserved_depth = OUTBOX_CAPACITY - MAX_LOCAL_PHYSICS_TICKS_PER_FRAME;
+    for tick in 1..=reserved_depth as u64 {
+        ticker
+            .enqueue_completed_physics(completed_sample(tick, [0.0; 3]))
+            .unwrap();
+    }
+    assert!(ticker.can_advance_physics_frame());
+
+    ticker
+        .enqueue_completed_physics(completed_sample(reserved_depth as u64 + 1, [0.0; 3]))
+        .unwrap();
+    assert!(!ticker.can_advance_physics_frame());
+    assert!(ticker.physics_is_authorized());
 }
 
 #[test]

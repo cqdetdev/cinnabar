@@ -12,18 +12,18 @@ use std::{
 use protocol::{
     ActorPositionOrigin, BlobCacheStats, ChangeDimensionEvent, InventoryAuthority, InventoryEvent,
     MovePlayerEvent, PLAYER_NETWORK_OFFSET, PlayerGameMode, PlayerMovementCorrectionEvent,
-    WorldBootstrap, WorldEnvironmentBootstrap, WorldEvent,
+    SetTimeEvent, WorldBootstrap, WorldEnvironmentBootstrap, WorldEvent,
 };
 use tokio::sync::{mpsc, oneshot, watch};
 
 use super::{
     COMMAND_CAPACITY, CONTROL_EVENT_CAPACITY, NetworkCommand, NetworkConfig, NetworkControlEvent,
     NetworkHandle, NetworkPumpPreference, NetworkPumpWork, NetworkSequencer, NetworkSession,
-    PacketSendError, SequencedWorldEvent, WORLD_EVENT_CAPACITY, WorldIngress,
-    bounded_counter_log_due, run_network_pump, send_control_event_or_cancel, send_event_or_cancel,
-    send_final_blob_cache_telemetry, send_world_event_or_cancel, start_game_inventory_authority,
-    wait_for_login_or_cancel, wait_for_network_work_or_cancel, wait_for_send_or_cancel,
-    write_network_pump_terminal_marker,
+    PacketSendError, ReadinessIngressCounter, SequencedWorldEvent, WORLD_EVENT_CAPACITY,
+    WorldIngress, bounded_counter_log_due, run_network_pump, send_control_event_or_cancel,
+    send_event_or_cancel, send_final_blob_cache_telemetry, send_world_event_or_cancel,
+    start_game_inventory_authority, wait_for_login_or_cancel, wait_for_network_work_or_cancel,
+    wait_for_send_or_cancel, wrap_readiness_tracked_event, write_network_pump_terminal_marker,
 };
 
 #[path = "physics_send_tests.rs"]
@@ -31,6 +31,48 @@ mod physics_send_tests;
 #[path = "routing_tests.rs"]
 mod routing_tests;
 
+#[test]
+fn readiness_ingress_counter_excludes_transport_only_events() {
+    let counter = ReadinessIngressCounter::default();
+    let transport_only = WorldEvent::SetTime(SetTimeEvent { time: 6_000 });
+    counter.record_produced(&transport_only);
+    assert_eq!(counter.pending(), 0);
+
+    let readiness_event = WorldEvent::ChunkRadiusUpdated(16);
+    counter.record_produced(&readiness_event);
+    assert_eq!(counter.pending(), 1);
+    counter.record_consumed(&readiness_event);
+    assert_eq!(counter.pending(), 0);
+
+    let mut sequencer = NetworkSequencer::new(7, 0, 42);
+    let remote_move = wrap_readiness_tracked_event(
+        &mut sequencer,
+        &counter,
+        WorldEvent::MovePlayer(MovePlayerEvent {
+            runtime_id: 99,
+            ..Default::default()
+        }),
+    );
+    assert!(matches!(remote_move.event, WorldEvent::Actor(_)));
+    assert_eq!(
+        counter.pending(),
+        0,
+        "remote movement is normalized to actor presentation before classification"
+    );
+
+    let local_move = wrap_readiness_tracked_event(
+        &mut sequencer,
+        &counter,
+        WorldEvent::MovePlayer(MovePlayerEvent {
+            runtime_id: 42,
+            ..Default::default()
+        }),
+    );
+    assert!(matches!(local_move.event, WorldEvent::MovePlayer(_)));
+    assert_eq!(counter.pending(), 1);
+    counter.record_consumed(&local_move.event);
+    assert_eq!(counter.pending(), 0);
+}
 #[test]
 fn cloned_network_configs_share_the_persistent_verified_blob_cache() {
     let config = NetworkConfig {
@@ -62,7 +104,7 @@ fn blob_cache_semantic_warning_schedule_is_logarithmically_bounded() {
 }
 
 #[test]
-fn blob_cache_log_line_exposes_every_pressure_counter() {
+fn blob_cache_log_line_exposes_pressure_and_recovery_counters() {
     let source = include_str!("../session.rs");
     let telemetry = source
         .split_once("fn emit_blob_cache_telemetry(stats: BlobCacheStats)")
@@ -72,6 +114,15 @@ fn blob_cache_log_line_exposes_every_pressure_counter() {
         .expect("blob-cache telemetry function body")
         .0;
     let expected = [
+        "retained_cached_transactions",
+        "ordinary_ready_events",
+        "ordinary_ready_bytes",
+        "recovery_ready_events",
+        "recovery_ready_bytes",
+        "redundant_missing_requests",
+        "abandoned_cached_transactions",
+        "recovery_requests",
+        "ordinary_backpressure",
         "cached_packet_transaction_pressure",
         "cached_packet_pending_pressure",
         "cached_packet_staged_pressure",
@@ -1077,6 +1128,7 @@ fn saturated_command_queue_preserves_packet_and_shutdown_does_not_join_on_ui_thr
         physics_reanchor,
         shutdown,
         thread: Some(worker),
+        readiness_ingress: Arc::new(ReadinessIngressCounter::default()),
     };
 
     let packet = test_packet();
@@ -1103,6 +1155,7 @@ fn network_pending_counts_include_ingress_and_outbound_queues() {
         physics_reanchor,
         shutdown,
         thread: None,
+        readiness_ingress: Arc::new(ReadinessIngressCounter::default()),
     };
 
     assert_eq!(handle.pending_event_count(), 0);

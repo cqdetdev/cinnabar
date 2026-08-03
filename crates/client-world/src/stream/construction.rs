@@ -138,7 +138,15 @@ impl WorldStream {
             light_failures: HashMap::new(),
             light_revisions: RevisionTracker::default(),
             pending_light: HashMap::new(),
+            pending_light_scan: VecDeque::new(),
+            pending_light_ready: BinaryHeap::new(),
+            pending_light_deferred: BinaryHeap::new(),
+            light_priority_wakeups: HashMap::new(),
+            light_scheduler_camera_cell: None,
             in_flight_light: HashMap::new(),
+            next_light_batch_id: 0,
+            in_flight_light_batches: HashMap::new(),
+            last_dispatched_light_batch: HashMap::new(),
             light_waiters: HashMap::new(),
             fatal_light_failure: false,
             fatal_error: None,
@@ -146,7 +154,14 @@ impl WorldStream {
             applied_mesh_generations: HashMap::new(),
             mesh_dependency_masks: HashMap::new(),
             pending_mesh: HashMap::new(),
+            pending_mesh_scan: VecDeque::new(),
+            pending_resident_mesh_deferred: BinaryHeap::new(),
+            pending_resident_mesh_ready: BinaryHeap::new(),
+            pending_mesh_removal_deferred: BinaryHeap::new(),
+            pending_mesh_removal_ready: BinaryHeap::new(),
+            mesh_scheduler_camera_cell: None,
             in_flight: HashMap::new(),
+            urgent_mesh_in_flight: HashSet::new(),
             resident: BTreeSet::new(),
             known_air: BTreeSet::new(),
             loaded_columns: BTreeSet::new(),
@@ -157,7 +172,8 @@ impl WorldStream {
             admitted_sub_chunk_replies: HashMap::new(),
             deferred_retries: VecDeque::new(),
             deferred_retry_set: HashSet::new(),
-            connectivity: HashMap::new(),
+            deferred_recovery_requests: VecDeque::new(),
+            connectivity: FastHashMap::new(),
             connectivity_generation: 0,
             requests: RequestQueue::default(),
             transport_pending_requests: 0,
@@ -260,7 +276,10 @@ impl WorldStream {
                 mode: LevelChunkMode::LimitlessRequests,
                 ..
             }) => true,
-            WorldEvent::ChunkResync(event) => event.requested_sub_chunks != Some(0),
+            WorldEvent::ChunkResync(event) => event
+                .requested_sub_chunk_ys
+                .as_ref()
+                .map_or(event.requested_sub_chunks != Some(0), |ys| !ys.is_empty()),
             _ => false,
         };
         if creates_request && self.requests.len() >= OUTBOUND_REQUEST_CAPACITY {
@@ -347,6 +366,17 @@ impl WorldStream {
                 }
                 self.record_sub_chunk_reply_admissions(&batch);
                 self.enqueue_decode_job(DecodeJob::SubChunks { sequence, batch });
+            }
+            WorldEvent::SubChunkReplyAdmission(admission) => {
+                self.record_sub_chunk_reply_admission(&admission);
+                if let Err(error) = self
+                    .ordered
+                    .insert(sequence, PreparedWorldEvent::CommitOnly)
+                {
+                    self.submitted.remove(&sequence);
+                    return Err(error.into());
+                }
+                self.apply_ready();
             }
             WorldEvent::BlockEntityUpdate(event) => {
                 self.enqueue_decode_job(DecodeJob::BlockEntityUpdate { sequence, event });

@@ -494,6 +494,7 @@ Describe 'FastTransferWitness focused LBSG acceptance' {
             -DurationSeconds 600 -Scenario FastTransferWitness -AuthCache token.json `
             -Assets vanilla.mcbea
         ($plan.AppArguments -ccontains '--phase3-candidate-physics') | Should Be $false
+        ($plan.AppArguments -ccontains '--auto-fly') | Should Be $false
         ($plan.CoreArguments -ccontains '-auth-cache') | Should Be $true
         { New-Phase3LaunchPlan -Target Lbsg -Endpoint 'play.lbsg.net:19132' `
                 -RunId $script:RunId -SocketDirectory socket -MetricsPath metrics.json `
