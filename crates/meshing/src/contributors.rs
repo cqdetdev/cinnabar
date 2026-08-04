@@ -273,7 +273,57 @@ impl<'a> PaletteFacts<'a> {
     }
 
     pub(crate) fn at(&self, x: usize, y: usize, z: usize) -> ResolvedPaletteEntry {
-        self.contributors_at(x, y, z).geometry_entry()
+        // Geometry callers need only the winning entry. Avoid materializing
+        // the full contributor tuple for every voxel in greedy/model passes.
+        match &self.source {
+            PaletteSource::Air => ResolvedPaletteEntry::AIR,
+            PaletteSource::Uniform(contributors) => contributors.geometry_entry(),
+            PaletteSource::Mixed(storages) => {
+                let mut primary = None;
+                let mut liquid = None;
+                for storage in storages {
+                    let Some(index) = packed_palette_index(storage.storage, x, y, z) else {
+                        return ResolvedPaletteEntry::diagnostic(0, None);
+                    };
+                    let Some(&entry) = storage.entries.get(index) else {
+                        return ResolvedPaletteEntry::diagnostic(0, None);
+                    };
+                    if entry.flags.contains(BlockFlags::AIR) {
+                        continue;
+                    }
+                    match entry.contributor_role {
+                        ContributorRole::Primary => {
+                            if primary.replace(entry).is_some() {
+                                return ResolvedPaletteEntry::diagnostic(
+                                    entry.network_value,
+                                    entry.sequential_id,
+                                );
+                            }
+                        }
+                        ContributorRole::LiquidAdditional
+                            if matches!(entry.kind, VisualKind::Liquid) =>
+                        {
+                            if liquid.is_some_and(|current: ResolvedPaletteEntry| {
+                                current.network_value != entry.network_value
+                            }) {
+                                return ResolvedPaletteEntry::diagnostic(
+                                    entry.network_value,
+                                    entry.sequential_id,
+                                );
+                            }
+                            liquid = Some(entry);
+                        }
+                        ContributorRole::LiquidAdditional | ContributorRole::Air => {
+                            return ResolvedPaletteEntry::diagnostic(
+                                entry.network_value,
+                                entry.sequential_id,
+                            );
+                        }
+                    }
+                }
+                primary.unwrap_or(ResolvedPaletteEntry::AIR)
+            }
+        }
     }
 }
 

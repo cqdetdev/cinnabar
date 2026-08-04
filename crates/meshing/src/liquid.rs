@@ -71,6 +71,7 @@ use crate::{
     BlockClassifier, ContributorResolver, Face, PackedLiquidQuad, PackedQuadLighting,
     ResolvedContributors, SIDE,
 };
+use crate::contributors::ResolvedPaletteEntry;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct LiquidIdentity([u32; Face::ALL.len()]);
@@ -97,17 +98,31 @@ impl LiquidCell {
     }
 }
 
-struct Sampler<'chunk, 'assets> {
-    resolvers: [Option<ContributorResolver<'chunk>>; 27],
-    assets: &'assets RuntimeAssets,
+#[derive(Clone, Copy)]
+struct LiquidSample {
+    primary: Option<ResolvedPaletteEntry>,
+    liquid_present: bool,
+    liquid: Option<LiquidCell>,
 }
 
-impl<'chunk, 'assets> Sampler<'chunk, 'assets> {
+/// Liquid meshing samples only the center sub-chunk plus a one-block halo.
+/// Cache the resolved primary/liquid contributors once so flow, corner-height,
+/// and face checks do not repeat packed-palette work for the same cell.
+const LIQUID_CACHE_SIDE: i32 = 18;
+const LIQUID_CACHE_VOLUME: usize =
+    (LIQUID_CACHE_SIDE as usize) * (LIQUID_CACHE_SIDE as usize) * (LIQUID_CACHE_SIDE as usize);
+
+struct Sampler<'assets> {
+    assets: &'assets RuntimeAssets,
+    samples: Box<[Option<LiquidSample>]>,
+}
+
+impl<'assets> Sampler<'assets> {
     fn new(
         classifier: BlockClassifier,
         assets: &'assets RuntimeAssets,
         mode: NetworkIdMode,
-        neighbourhood: &MeshNeighbourhood<'chunk>,
+        neighbourhood: &MeshNeighbourhood<'_>,
     ) -> Self {
         let mut resolvers = std::array::from_fn(|_| None);
         for (offset, chunk) in neighbourhood.liquid_sub_chunks() {
@@ -116,34 +131,45 @@ impl<'chunk, 'assets> Sampler<'chunk, 'assets> {
                     Some(ContributorResolver::new(classifier, assets, mode, chunk));
             }
         }
-        Self { resolvers, assets }
+        let mut samples = vec![None; LIQUID_CACHE_VOLUME].into_boxed_slice();
+        for x in -1..=16 {
+            for y in -1..=16 {
+                for z in -1..=16 {
+                    let coordinate = [x, y, z];
+                    let Some((_, local)) = neighbourhood.liquid_block_source(coordinate) else {
+                        continue;
+                    };
+                    let offset = coordinate.map(|value| {
+                        i8::try_from(value.div_euclid(16)).expect("liquid cache offset is bounded")
+                    });
+                    let Some(resolver) = resolvers[offset_index(offset)].as_ref() else {
+                        continue;
+                    };
+                    samples[liquid_cache_index(coordinate)
+                        .expect("18-cubed liquid cache coordinates are bounded")] =
+                        Some(liquid_sample(assets, resolver.resolve(local)));
+                }
+            }
+        }
+        Self { assets, samples }
     }
 }
 
 trait LiquidSampler {
     fn assets(&self) -> &RuntimeAssets;
 
-    fn contributors(
+    fn sample(
         &self,
         neighbourhood: &MeshNeighbourhood<'_>,
         coordinate: [i32; 3],
-    ) -> Option<ResolvedContributors>;
+    ) -> Option<LiquidSample>;
 
     fn liquid(
         &self,
         neighbourhood: &MeshNeighbourhood<'_>,
         coordinate: [i32; 3],
     ) -> Option<LiquidCell> {
-        let entry = self
-            .contributors(neighbourhood, coordinate)?
-            .liquid_entry()?;
-        let depth_writing = supported_liquid_material_family(self.assets(), entry.faces)?;
-        (entry.kind == VisualKind::Liquid).then_some(LiquidCell {
-            identity: LiquidIdentity(entry.faces),
-            face_materials: entry.faces,
-            level: LiquidLevel::from_variant(entry.variant)?,
-            depth_writing,
-        })
+        self.sample(neighbourhood, coordinate)?.liquid
     }
 
     fn open(
@@ -152,10 +178,10 @@ trait LiquidSampler {
         coordinate: [i32; 3],
         contacting_faces: &[Face],
     ) -> bool {
-        self.contributors(neighbourhood, coordinate)
-            .is_none_or(|contributors| {
-                contributors.liquid_entry().is_none()
-                    && !contributors.primary_entry().is_some_and(|entry| {
+        self.sample(neighbourhood, coordinate)
+            .is_none_or(|sample| {
+                !sample.liquid_present
+                    && !sample.primary.is_some_and(|entry| {
                         entry.flags.contains(BlockFlags::OCCLUDES_FULL_FACE)
                             && contacting_faces.iter().all(|&face| {
                                 material_is_opaque(self.assets(), entry.faces[face as usize])
@@ -170,8 +196,8 @@ trait LiquidSampler {
         coordinate: [i32; 3],
         contacting_face: Face,
     ) -> bool {
-        self.contributors(neighbourhood, coordinate)
-            .and_then(ResolvedContributors::primary_entry)
+        self.sample(neighbourhood, coordinate)
+            .and_then(|sample| sample.primary)
             .is_some_and(|entry| {
                 entry.flags.contains(BlockFlags::OCCLUDES_FULL_FACE)
                     && material_is_opaque(self.assets(), entry.faces[contacting_face as usize])
@@ -179,23 +205,17 @@ trait LiquidSampler {
     }
 }
 
-impl LiquidSampler for Sampler<'_, '_> {
+impl LiquidSampler for Sampler<'_> {
     fn assets(&self) -> &RuntimeAssets {
         self.assets
     }
 
-    fn contributors(
+    fn sample(
         &self,
-        neighbourhood: &MeshNeighbourhood<'_>,
+        _neighbourhood: &MeshNeighbourhood<'_>,
         coordinate: [i32; 3],
-    ) -> Option<ResolvedContributors> {
-        let (_, local) = neighbourhood.liquid_block_source(coordinate)?;
-        let offset = coordinate
-            .map(|value| i8::try_from(value.div_euclid(16)).ok())
-            .map(Option::unwrap);
-        self.resolvers[offset_index(offset)]
-            .as_ref()
-            .map(|resolver| resolver.resolve(local))
+    ) -> Option<LiquidSample> {
+        liquid_cache_index(coordinate).and_then(|index| self.samples[index])
     }
 }
 
@@ -210,19 +230,43 @@ impl LiquidSampler for DirectSampler<'_> {
         self.assets
     }
 
-    fn contributors(
+    fn sample(
         &self,
         neighbourhood: &MeshNeighbourhood<'_>,
         coordinate: [i32; 3],
-    ) -> Option<ResolvedContributors> {
+    ) -> Option<LiquidSample> {
         let (sub_chunk, local) = neighbourhood.liquid_block_source(coordinate)?;
-        Some(ContributorResolver::resolve_direct(
-            self.classifier,
+        Some(liquid_sample(
             self.assets,
-            self.mode,
-            sub_chunk,
-            local,
+            ContributorResolver::resolve_direct(
+                self.classifier,
+                self.assets,
+                self.mode,
+                sub_chunk,
+                local,
+            ),
         ))
+    }
+}
+
+fn liquid_sample(
+    assets: &RuntimeAssets,
+    contributors: ResolvedContributors,
+) -> LiquidSample {
+    let liquid_entry = contributors.liquid_entry();
+    let liquid = liquid_entry.and_then(|entry| {
+        let depth_writing = supported_liquid_material_family(assets, entry.faces)?;
+        (entry.kind == VisualKind::Liquid).then_some(LiquidCell {
+            identity: LiquidIdentity(entry.faces),
+            face_materials: entry.faces,
+            level: LiquidLevel::from_variant(entry.variant)?,
+            depth_writing,
+        })
+    });
+    LiquidSample {
+        primary: contributors.primary_entry(),
+        liquid_present: liquid_entry.is_some(),
+        liquid,
     }
 }
 
@@ -622,6 +666,15 @@ const fn face_offset(face: Face) -> [i32; 3] {
 }
 const fn offset_index([x, y, z]: [i8; 3]) -> usize {
     ((x + 1) as usize) * 9 + ((y + 1) as usize) * 3 + (z + 1) as usize
+}
+
+fn liquid_cache_index([x, y, z]: [i32; 3]) -> Option<usize> {
+    if !(-1..=16).contains(&x) || !(-1..=16).contains(&y) || !(-1..=16).contains(&z) {
+        return None;
+    }
+    Some(((x + 1) as usize * LIQUID_CACHE_SIDE as usize + (y + 1) as usize)
+        * LIQUID_CACHE_SIDE as usize
+        + (z + 1) as usize)
 }
 
 fn lighting_positions(face: Face, heights: [u8; 4]) -> [[i16; 3]; 4] {

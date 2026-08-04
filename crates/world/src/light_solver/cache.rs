@@ -1,5 +1,6 @@
 use super::{
-    BlockPos, LightBlockAccess, LightBlockSample, LightBounds, light_axis_len, light_dense_index,
+    BlockPos, BoundaryLightSample, LightBlockAccess, LightBlockSample, LightBounds, LightChannel,
+    LightReadAccess, light_axis_len, light_dense_index,
 };
 
 #[derive(Debug, Clone)]
@@ -77,5 +78,82 @@ impl<A: LightBlockAccess> LightBlockAccess for CachedLightBlockAccess<'_, A> {
             || self.source.sky_seed(position),
             |index| self.sky_seeds[index],
         )
+    }
+}
+
+/// Dense interior reads avoid repeating sparse-store lookups for every
+/// darken/increase queue operation. Exact halo reads still delegate to the
+/// source because their generation-qualified boundary contract is sparse.
+pub(super) struct CachedLightReadAccess<'a, P: ?Sized> {
+    source: &'a P,
+    bounds: LightBounds,
+    y_len: usize,
+    z_len: usize,
+    block: Box<[u8]>,
+    sky: Box<[u8]>,
+    direct_sky: Box<[bool]>,
+}
+
+impl<'a, P: LightReadAccess + ?Sized> CachedLightReadAccess<'a, P> {
+    pub(super) fn new(source: &'a P, bounds: LightBounds, volume: usize) -> Self {
+        let y_len = light_axis_len(bounds.min.y, bounds.max.y);
+        let z_len = light_axis_len(bounds.min.z, bounds.max.z);
+        let mut block = Vec::with_capacity(volume);
+        let mut sky = Vec::with_capacity(volume);
+        let mut direct_sky = Vec::with_capacity(volume);
+        for position in bounds.positions() {
+            block.push(source.read_light(bounds.dimension, position, LightChannel::Block));
+            sky.push(source.read_light(bounds.dimension, position, LightChannel::Sky));
+            direct_sky.push(source.has_direct_sky_provenance(bounds.dimension, position));
+        }
+        Self {
+            source,
+            bounds,
+            y_len,
+            z_len,
+            block: block.into_boxed_slice(),
+            sky: sky.into_boxed_slice(),
+            direct_sky: direct_sky.into_boxed_slice(),
+        }
+    }
+
+    fn index(&self, position: BlockPos) -> Option<usize> {
+        light_dense_index(self.bounds, self.y_len, self.z_len, position)
+    }
+}
+
+impl<P: LightReadAccess + ?Sized> LightReadAccess for CachedLightReadAccess<'_, P> {
+    fn read_light(&self, dimension: i32, position: BlockPos, channel: LightChannel) -> u8 {
+        if dimension != self.bounds.dimension {
+            return self.source.read_light(dimension, position, channel);
+        }
+        self.index(position).map_or_else(
+            || self.source.read_light(dimension, position, channel),
+            |index| match channel {
+                LightChannel::Block => self.block[index],
+                LightChannel::Sky => self.sky[index],
+            },
+        )
+    }
+
+    fn has_direct_sky_provenance(&self, dimension: i32, position: BlockPos) -> bool {
+        if dimension != self.bounds.dimension {
+            return self
+                .source
+                .has_direct_sky_provenance(dimension, position);
+        }
+        self.index(position).map_or_else(
+            || self.source.has_direct_sky_provenance(dimension, position),
+            |index| self.direct_sky[index],
+        )
+    }
+
+    fn boundary_light(
+        &self,
+        dimension: i32,
+        position: BlockPos,
+        channel: LightChannel,
+    ) -> BoundaryLightSample {
+        self.source.boundary_light(dimension, position, channel)
     }
 }
