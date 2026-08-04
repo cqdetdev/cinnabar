@@ -65,6 +65,86 @@ impl MeshLightSampler for FullBrightLightSampler {
     }
 }
 
+const LIGHT_CACHE_SIDE: usize = 18;
+const LIGHT_CACHE_VOLUME: usize = LIGHT_CACHE_SIDE * LIGHT_CACHE_SIDE * LIGHT_CACHE_SIDE;
+const LIGHT_CACHE_WORDS: usize = LIGHT_CACHE_VOLUME.div_ceil(64);
+
+/// Dense per-mesh lighting inputs for the exact one-block halo used by AO.
+///
+/// Resolving a packed palette and its block flags is comparatively expensive,
+/// so the six face samples for every emitted vertex reuse this bounded cache.
+/// The cache is intentionally local to one mesh job and never becomes world
+/// state; missing neighbour sub-chunks remain open space.
+pub(crate) struct MeshLightingCache {
+    occluders: [u64; LIGHT_CACHE_WORDS],
+    light: [MeshLightSample; LIGHT_CACHE_VOLUME],
+}
+
+impl MeshLightingCache {
+    pub(crate) fn new<S: MeshLightSampler + ?Sized>(
+        classifier: BlockClassifier,
+        assets: &RuntimeAssets,
+        network_id_mode: NetworkIdMode,
+        neighbourhood: &MeshNeighbourhood<'_>,
+        light_sampler: &S,
+    ) -> Self {
+        let mut cache = Self {
+            occluders: [0; LIGHT_CACHE_WORDS],
+            light: [MeshLightSample::FULL_BRIGHT; LIGHT_CACHE_VOLUME],
+        };
+        for x in -1..=16 {
+            for y in -1..=16 {
+                for z in -1..=16 {
+                    let coordinate = [x, y, z];
+                    let index = light_cache_index(coordinate)
+                        .expect("18-cubed lighting cache coordinates are bounded");
+                    cache.light[index] = light_sampler.sample(coordinate);
+                    let Some((sub_chunk, local)) = neighbourhood.block_source(coordinate) else {
+                        continue;
+                    };
+                    let occludes = (0..sub_chunk.storages().len()).any(|layer| {
+                        sub_chunk
+                            .runtime_id(layer, local[0], local[1], local[2])
+                            .is_some_and(|network_value| {
+                                !classifier.is_air(network_value)
+                                    && assets
+                                        .resolve(network_id_mode, network_value)
+                                        .flags()
+                                        .contains(assets::BlockFlags::OCCLUDES_FULL_FACE)
+                            })
+                    });
+                    if occludes {
+                        cache.occluders[index / 64] |= 1_u64 << (index % 64);
+                    }
+                }
+            }
+        }
+        cache
+    }
+
+    #[must_use]
+    pub(crate) fn sample(&self, coordinate: [i32; 3]) -> MeshLightSample {
+        light_cache_index(coordinate)
+            .map(|index| self.light[index])
+            .unwrap_or(MeshLightSample::FULL_BRIGHT)
+    }
+
+    #[must_use]
+    pub(crate) fn occludes(&self, coordinate: [i32; 3]) -> bool {
+        light_cache_index(coordinate).is_some_and(|index| {
+            self.occluders[index / 64] & (1_u64 << (index % 64)) != 0
+        })
+    }
+}
+
+fn light_cache_index([x, y, z]: [i32; 3]) -> Option<usize> {
+    if !(-1..=16).contains(&x) || !(-1..=16).contains(&y) || !(-1..=16).contains(&z) {
+        return None;
+    }
+    Some(((x + 1) as usize * LIGHT_CACHE_SIDE + (y + 1) as usize) * LIGHT_CACHE_SIDE
+        + (z + 1) as usize)
+}
+
 /// Bakes one face-specific four-vertex lighting sidecar.
 #[must_use]
 pub fn bake_quad_lighting(
@@ -137,6 +217,45 @@ pub fn bake_quad_lighting_with_sampler<S: MeshLightSampler + ?Sized>(
     PackedQuadLighting::new(samples)
 }
 
+pub(crate) fn bake_quad_lighting_with_cache(
+    cache: &MeshLightingCache,
+    block: [i32; 3],
+    face: Face,
+    positions: [[i16; 3]; 4],
+) -> PackedQuadLighting {
+    let (normal, tangent_a, tangent_b) = face_basis(face);
+    let outward = add_normal(block, normal);
+    let samples = positions.map(|position| {
+        let sign_a = corner_sign(position[tangent_a]);
+        let sign_b = corner_sign(position[tangent_b]);
+        let side_a_position = offset(block, normal, tangent_a, sign_a, None);
+        let side_b_position = offset(block, normal, tangent_b, sign_b, None);
+        let corner_position = offset(
+            block,
+            normal,
+            tangent_a,
+            sign_a,
+            Some((tangent_b, sign_b)),
+        );
+        let side_a = cache.occludes(side_a_position);
+        let side_b = cache.occludes(side_b_position);
+        let corner = cache.occludes(corner_position);
+        let ao = if side_a && side_b {
+            3
+        } else {
+            u8::from(side_a) + u8::from(side_b) + u8::from(corner)
+        };
+        let light = average_light([
+            cache.sample(outward),
+            cache.sample(side_a_position),
+            cache.sample(side_b_position),
+            cache.sample(corner_position),
+        ]);
+        pack_sample(light.block(), light.sky(), ao)
+    });
+    PackedQuadLighting::new(samples)
+}
+
 /// Bakes exactly one sidecar for every quad in a template's immutable order.
 #[must_use]
 pub fn bake_template_lighting(
@@ -193,6 +312,38 @@ pub fn bake_template_lighting_with_sampler<S: MeshLightSampler + ?Sized>(
                             network_id_mode,
                             neighbourhood,
                             light_sampler,
+                            block,
+                            face,
+                            quad.positions
+                                .map(|position| rotate_model_position(position, rotation)),
+                        )
+                    },
+                )
+            })
+            .collect(),
+    )
+}
+
+pub(crate) fn bake_template_lighting_with_cache(
+    cache: &MeshLightingCache,
+    assets: &RuntimeAssets,
+    block: [i32; 3],
+    template_id: u32,
+    rotation: u32,
+) -> Option<Vec<PackedQuadLighting>> {
+    let template = assets.model_templates().get(template_id as usize)?;
+    let start = template.quad_start as usize;
+    let end = start.checked_add(template.quad_count as usize)?;
+    let quads = assets.model_quads().get(start..end)?;
+    Some(
+        quads
+            .iter()
+            .map(|quad| {
+                model_quad_face(*quad, rotation).map_or_else(
+                    || lighting_at(cache.sample(block)),
+                    |face| {
+                        bake_quad_lighting_with_cache(
+                            cache,
                             block,
                             face,
                             quad.positions

@@ -89,8 +89,8 @@ pub use publication_test_support::{PublicationFixtureIdentity, PublicationFixtur
 /// Decode and mesh workers may each have at most this many completed results
 /// waiting for the main thread. A full channel applies backpressure to Rayon.
 pub const WORK_RESULT_CAPACITY: usize = 512;
-pub const MAX_ADMITTED_WORLD_EVENTS: usize = 64;
-pub const MAX_ADMITTED_HEAVY_EVENTS: usize = 32;
+pub const MAX_ADMITTED_WORLD_EVENTS: usize = 128;
+pub const MAX_ADMITTED_HEAVY_EVENTS: usize = 128;
 pub const MAX_IN_FLIGHT_DECODE_JOBS: usize = MAX_ADMITTED_HEAVY_EVENTS;
 pub const DECODE_DISPATCH_BUDGET_PER_POLL: usize = MAX_ADMITTED_HEAVY_EVENTS;
 pub const PHASE0_MAX_VIEW_RADIUS_CHUNKS: i32 = 16;

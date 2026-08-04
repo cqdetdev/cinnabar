@@ -437,6 +437,7 @@ pub(crate) fn record_metrics_and_title(
     transparent_witness: Res<TransparentWitnessEvidence>,
     model_witness: Res<ModelWitnessEvidence>,
     visibility_diagnostics: Res<VisibilityDiagnostics>,
+    diagnostics_input: Res<VisibilityDiagnosticsInput>,
     runtime_config: Res<AcceptanceRuntimeConfig>,
     chunks: Query<&ChunkRenderInstance>,
     camera: Query<&Transform, With<FlyCamera>>,
@@ -448,7 +449,9 @@ pub(crate) fn record_metrics_and_title(
         .as_deref()
         .map(|profiler| profiler.time(RuntimeStage::AcceptanceTelemetry));
     let now = Instant::now();
-    if !sampling.runtime_metadata_emitted
+    let diagnostics_enabled = diagnostics_input.enabled();
+    if diagnostics_enabled
+        && !sampling.runtime_metadata_emitted
         && let Some(graphics_adapter) = visibility_diagnostics.graphics_adapter()
     {
         let marker = acceptance_runtime_metadata_marker(*runtime_config, &graphics_adapter);
@@ -456,14 +459,16 @@ pub(crate) fn record_metrics_and_title(
         write_stdout_marker(&mut stdout, &marker);
         sampling.runtime_metadata_emitted = true;
     }
-    let gpu_sample = {
-        let diagnostics = &render_metrics.diagnostics;
-        pair_gpu_pass_sample(
-            sampling.last_gpu_measurement_time,
-            gpu_pass_measurement(diagnostics, &OPAQUE_3D_GPU_DIAGNOSTIC),
-            gpu_pass_measurement(diagnostics, &TRANSPARENT_3D_GPU_DIAGNOSTIC),
-        )
-    };
+    let gpu_sample = diagnostics_enabled
+        .then(|| {
+            let diagnostics = &render_metrics.diagnostics;
+            pair_gpu_pass_sample(
+                sampling.last_gpu_measurement_time,
+                gpu_pass_measurement(diagnostics, &OPAQUE_3D_GPU_DIAGNOSTIC),
+                gpu_pass_measurement(diagnostics, &TRANSPARENT_3D_GPU_DIAGNOSTIC),
+            )
+        })
+        .flatten();
     if let Some((measurement_time, sample)) = gpu_sample {
         sampling.last_gpu_measurement_time = Some(measurement_time);
         metrics.0.record_gpu_pass_sample(measurement_time, sample);
@@ -478,15 +483,18 @@ pub(crate) fn record_metrics_and_title(
         client_world.runtime_assets.missing_count(),
         diagnostic_quads.0.total(),
     );
-    if let Some(marker) = refresh_diagnostic_attribution(
-        &mut sampling.diagnostic_attribution_revision,
-        &diagnostic_quads.0,
-        &mut metrics.0,
-    ) {
+    if diagnostics_enabled
+        && let Some(marker) = refresh_diagnostic_attribution(
+            &mut sampling.diagnostic_attribution_revision,
+            &diagnostic_quads.0,
+            &mut metrics.0,
+        )
+    {
         info!("{marker}");
     }
     let visibility_snapshot = visibility_diagnostics.snapshot();
-    if let (Some(stream), Some(local_frame), Some(graphics)) = (
+    if diagnostics_enabled
+        && let (Some(stream), Some(local_frame), Some(graphics)) = (
         client_world.stream.as_ref(),
         render_metrics.local_player.snapshot(),
         visibility_diagnostics.graphics_adapter(),
@@ -647,7 +655,9 @@ pub(crate) fn record_metrics_and_title(
             });
     }
     sampling.visibility_elapsed += frame_time;
-    if sampling.visibility_elapsed >= VISIBILITY_DIAGNOSTIC_INTERVAL {
+    if diagnostics_enabled
+        && sampling.visibility_elapsed >= VISIBILITY_DIAGNOSTIC_INTERVAL
+    {
         sampling.visibility_elapsed = Duration::ZERO;
         let snapshot = visibility_snapshot;
         if biome_blend_diagnostics_enabled(&acceptance)
@@ -736,95 +746,99 @@ pub(crate) fn record_metrics_and_title(
         TransparentSortMetricsSnapshot::from(render_metrics.transparent_sort.snapshot());
     let model_workload_snapshot =
         ModelWorkloadMetricsSnapshot::from(render_metrics.model_workload.snapshot());
-    if let Some(marker) = transparent_sort_committed_marker(
-        sampling.last_marked_transparent_sort_generation,
-        transparent_sort_snapshot,
-    ) {
+    if diagnostics_enabled
+        && let Some(marker) = transparent_sort_committed_marker(
+            sampling.last_marked_transparent_sort_generation,
+            transparent_sort_snapshot,
+        )
+    {
         let mut stdout = std::io::stdout().lock();
         write_stdout_marker(&mut stdout, &marker);
         sampling.last_marked_transparent_sort_generation =
             transparent_sort_snapshot.presented_generation;
     }
-    for event in transparent_witness.drain_events() {
-        let marker = format!(
-            "{TRANSPARENT_WITNESS_COMPLETE} revision={} sequence={} generation={} key_count={} consecutive={}",
-            event.revision, event.sequence, event.generation, event.key_count, event.consecutive,
-        );
-        let mut stdout = std::io::stdout().lock();
-        write_stdout_marker(&mut stdout, &marker);
-    }
-    for event in model_witness.drain_events() {
-        let acknowledgement = &event.acknowledgement;
-        let marker = format!(
-            "{MODEL_WITNESS_COMPLETE} revision={} request_sha256={} sequence={} view_generation={} key_count={} model_ref_count={} manifest_count={} manifest_sha256={} missing={} stale={} wrong_stream={} zero_ref={} draw_mismatch={} consecutive={}",
-            acknowledgement.revision,
-            lower_hex(&acknowledgement.request_hash),
-            acknowledgement.frame_sequence,
-            acknowledgement.view_generation,
-            acknowledgement.manifest.len(),
-            acknowledgement.total_model_ref_count,
-            acknowledgement.manifest.len(),
-            model_witness_manifest_hash(&acknowledgement.manifest),
-            acknowledgement.missing_key_count,
-            acknowledgement.stale_generation_count,
-            acknowledgement.wrong_stream_count,
-            acknowledgement.zero_model_ref_count,
-            acknowledgement.draw_mismatch_count,
-            event.consecutive,
-        );
-        let mut stdout = std::io::stdout().lock();
-        write_stdout_marker(&mut stdout, &marker);
-    }
-    for event in transparent_witness.drain_incomplete_events() {
-        let missing = event
-            .missing_keys
-            .iter()
-            .map(|key| format!("{},{},{},{}", key.dimension, key.x, key.y, key.z))
-            .collect::<Vec<_>>()
-            .join(";");
-        let marker = format!(
-            "{TRANSPARENT_WITNESS_INCOMPLETE} revision={} sequence={} generation={} missing_count={} missing={missing}",
-            event.revision,
-            event.sequence,
-            event.generation,
-            event.missing_keys.len(),
-        );
-        let mut stdout = std::io::stdout().lock();
-        write_stdout_marker(&mut stdout, &marker);
-    }
-    for event in transparent_witness.drain_stage_events() {
-        let records = event
-            .records
-            .iter()
-            .map(|record| {
-                let app_entity = chunks.iter().any(|instance| instance.key() == record.key);
-                format!(
-                    "{},{},{},{}:app_entity={}:cave_visible={}:extracted_visible={}:instance={}:liquid_quads={}:instance_generation={}:allocation={}:liquid_range={}:lighting_range={}:allocation_matches={}:committed_member={}",
-                    record.key.dimension,
-                    record.key.x,
-                    record.key.y,
-                    record.key.z,
-                    u8::from(app_entity),
-                    u8::from(cache.visible.contains(&record.key)),
-                    u8::from(record.extracted_visible),
-                    u8::from(record.instance_present),
-                    record.liquid_quad_count,
-                    record.instance_generation,
-                    u8::from(record.allocation_present),
-                    record.liquid_range_len,
-                    record.lighting_range_len,
-                    u8::from(record.allocation_matches),
-                    u8::from(record.committed_member),
-                )
-            })
-            .collect::<Vec<_>>()
-            .join(";");
-        let marker = format!(
-            "{TRANSPARENT_WITNESS_STAGE} revision={} committed_generation={} records={records}",
-            event.revision, event.committed_generation,
-        );
-        let mut stdout = std::io::stdout().lock();
-        write_stdout_marker(&mut stdout, &marker);
+    if diagnostics_enabled {
+        for event in transparent_witness.drain_events() {
+            let marker = format!(
+                "{TRANSPARENT_WITNESS_COMPLETE} revision={} sequence={} generation={} key_count={} consecutive={}",
+                event.revision, event.sequence, event.generation, event.key_count, event.consecutive,
+            );
+            let mut stdout = std::io::stdout().lock();
+            write_stdout_marker(&mut stdout, &marker);
+        }
+        for event in model_witness.drain_events() {
+            let acknowledgement = &event.acknowledgement;
+            let marker = format!(
+                "{MODEL_WITNESS_COMPLETE} revision={} request_sha256={} sequence={} view_generation={} key_count={} model_ref_count={} manifest_count={} manifest_sha256={} missing={} stale={} wrong_stream={} zero_ref={} draw_mismatch={} consecutive={}",
+                acknowledgement.revision,
+                lower_hex(&acknowledgement.request_hash),
+                acknowledgement.frame_sequence,
+                acknowledgement.view_generation,
+                acknowledgement.manifest.len(),
+                acknowledgement.total_model_ref_count,
+                acknowledgement.manifest.len(),
+                model_witness_manifest_hash(&acknowledgement.manifest),
+                acknowledgement.missing_key_count,
+                acknowledgement.stale_generation_count,
+                acknowledgement.wrong_stream_count,
+                acknowledgement.zero_model_ref_count,
+                acknowledgement.draw_mismatch_count,
+                event.consecutive,
+            );
+            let mut stdout = std::io::stdout().lock();
+            write_stdout_marker(&mut stdout, &marker);
+        }
+        for event in transparent_witness.drain_incomplete_events() {
+            let missing = event
+                .missing_keys
+                .iter()
+                .map(|key| format!("{},{},{},{}", key.dimension, key.x, key.y, key.z))
+                .collect::<Vec<_>>()
+                .join(";");
+            let marker = format!(
+                "{TRANSPARENT_WITNESS_INCOMPLETE} revision={} sequence={} generation={} missing_count={} missing={missing}",
+                event.revision,
+                event.sequence,
+                event.generation,
+                event.missing_keys.len(),
+            );
+            let mut stdout = std::io::stdout().lock();
+            write_stdout_marker(&mut stdout, &marker);
+        }
+        for event in transparent_witness.drain_stage_events() {
+            let records = event
+                .records
+                .iter()
+                .map(|record| {
+                    let app_entity = chunks.iter().any(|instance| instance.key() == record.key);
+                    format!(
+                        "{},{},{},{}:app_entity={}:cave_visible={}:extracted_visible={}:instance={}:liquid_quads={}:instance_generation={}:allocation={}:liquid_range={}:lighting_range={}:allocation_matches={}:committed_member={}",
+                        record.key.dimension,
+                        record.key.x,
+                        record.key.y,
+                        record.key.z,
+                        u8::from(app_entity),
+                        u8::from(cache.visible.contains(&record.key)),
+                        u8::from(record.extracted_visible),
+                        u8::from(record.instance_present),
+                        record.liquid_quad_count,
+                        record.instance_generation,
+                        u8::from(record.allocation_present),
+                        record.liquid_range_len,
+                        record.lighting_range_len,
+                        u8::from(record.allocation_matches),
+                        u8::from(record.committed_member),
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(";");
+            let marker = format!(
+                "{TRANSPARENT_WITNESS_STAGE} revision={} committed_generation={} records={records}",
+                event.revision, event.committed_generation,
+            );
+            let mut stdout = std::io::stdout().lock();
+            write_stdout_marker(&mut stdout, &marker);
+        }
     }
     let stream_errors = client_world.stream.as_ref().map_or(0, |stream| {
         let stats = stream.stats();

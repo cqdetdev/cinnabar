@@ -1120,7 +1120,7 @@ fn control_ingress_is_bounded_to_outbound_budget_and_preserves_fifo() {
 
 #[test]
 fn world_ingress_matches_heavy_admission_window_and_preserves_fifo() {
-    assert_eq!(NETWORK_INGRESS_BUDGET_PER_FRAME, 32);
+    assert_eq!(NETWORK_INGRESS_BUDGET_PER_FRAME, 128);
     let (sender, mut receiver) = tokio::sync::mpsc::channel(NETWORK_INGRESS_BUDGET_PER_FRAME + 2);
     for value in 0..NETWORK_INGRESS_BUDGET_PER_FRAME + 2 {
         sender.try_send(value).unwrap();

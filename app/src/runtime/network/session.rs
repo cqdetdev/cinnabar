@@ -23,7 +23,7 @@ use crate::{
     ui_runtime::FastTransferAction,
 };
 
-pub(crate) const WORLD_EVENT_CAPACITY: usize = 32;
+pub(crate) const WORLD_EVENT_CAPACITY: usize = 128;
 const CONTROL_EVENT_CAPACITY: usize = 64;
 const COMMAND_CAPACITY: usize = 64;
 const FINAL_CONTROL_FLUSH_TIMEOUT: Duration = Duration::from_millis(250);

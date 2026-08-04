@@ -58,6 +58,8 @@ func Serve(ctx context.Context, cfg Config) (err error) {
 		AuthenticationDisabled: true,
 		AllowUnknownPackets:    true,
 		EnableBatchReading:     true,
+		Compression:            packet.NopCompression,
+		CompressionThreshold:   65535,
 		ErrorLog:               slog.Default().With("component", "local-listener"),
 	}).ListenNetwork(streamnet.New(cfg.SocketDir), "")
 	if err != nil {

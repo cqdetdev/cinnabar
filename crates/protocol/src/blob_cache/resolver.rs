@@ -102,13 +102,18 @@ impl BlobCacheResolver {
         packet: Packet,
         raw_packet_bytes: Option<usize>,
     ) -> Result<BlobCacheStatus, BlobCacheError> {
-        let skipped_packet = packet.clone();
+        // Keep a recovery copy only for the two semantic shape errors that
+        // need to be classified after the packet-consuming fast path. Valid
+        // LevelChunk packets move directly into the pending transaction.
+        let skipped_packet = semantic_shape_recovery_needed(&packet).then(|| packet.clone());
         match self.accept_cached_packet_inner(packet, raw_packet_bytes) {
             Ok(status) => Ok(status),
             Err(
                 BlobCacheError::InvalidLevelChunkCount(_)
                 | BlobCacheError::InvalidLevelChunkHashCount { .. },
             ) => {
+                let skipped_packet = skipped_packet
+                    .expect("semantic shape recovery was preclassified before consuming packet");
                 self.stats.skipped_cached_packets =
                     self.stats.skipped_cached_packets.saturating_add(1);
                 self.stats.cached_packet_semantic_shape =
@@ -909,6 +914,23 @@ impl BlobCacheResolver {
             .cached_packet_reconstruction_pressure
             .saturating_add(1);
     }
+}
+
+fn semantic_shape_recovery_needed(packet: &Packet) -> bool {
+    let McpePacketData::PacketLevelChunk(packet) = &packet.data else {
+        return false;
+    };
+    let Some(blobs) = packet.blobs.as_ref() else {
+        return false;
+    };
+    let expected = match packet.sub_chunk_count {
+        count if count >= 0 => usize::try_from(count)
+            .ok()
+            .and_then(|count| count.checked_add(1)),
+        -1 | -2 => Some(1),
+        _ => None,
+    };
+    expected.is_none_or(|expected| blobs.hashes.len() != expected)
 }
 
 impl Drop for BlobCacheResolver {

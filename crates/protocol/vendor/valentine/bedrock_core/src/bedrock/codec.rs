@@ -1,6 +1,5 @@
 use bytes::{Buf, BufMut, Bytes};
-use std::io::Cursor;
-use std::mem;
+use std::{any::TypeId, io::Cursor, mem, slice};
 
 use crate::bedrock::context::BedrockSession;
 use crate::bedrock::error::DecodeError;
@@ -398,13 +397,20 @@ impl<T: BedrockSized> BedrockSized for Box<T> {
     }
 }
 
-impl<T: BedrockCodec> BedrockCodec for Vec<T>
+impl<T: BedrockCodec + 'static> BedrockCodec for Vec<T>
 where
     T::Args: Clone,
 {
     type Args = T::Args;
     fn encode<B: BufMut>(&self, buf: &mut B) -> Result<(), std::io::Error> {
         crate::protocol::wire::write_var_u32(buf, self.len() as u32);
+        if TypeId::of::<T>() == TypeId::of::<u8>() {
+            // The type-id check makes this cast exact: Vec<u8> has no padding
+            // and its allocation is already laid out as the wire byte array.
+            let bytes = unsafe { slice::from_raw_parts(self.as_ptr().cast::<u8>(), self.len()) };
+            buf.put_slice(bytes);
+            return Ok(());
+        }
         for item in self {
             item.encode(buf)?;
         }
@@ -412,6 +418,22 @@ where
     }
     fn decode<B: Buf>(buf: &mut B, args: Self::Args) -> Result<Self, DecodeError> {
         let len = crate::protocol::wire::read_var_u32(buf)? as usize;
+        if TypeId::of::<T>() == TypeId::of::<u8>() {
+            if buf.remaining() < len {
+                return Err(DecodeError::UnexpectedEof {
+                    needed: len,
+                    available: buf.remaining(),
+                });
+            }
+            let mut bytes = vec![0_u8; len];
+            buf.copy_to_slice(&mut bytes);
+            let ptr = bytes.as_mut_ptr();
+            let capacity = bytes.capacity();
+            mem::forget(bytes);
+            // The type-id check above guarantees T is exactly u8, so the
+            // allocation can be adopted without a per-byte decode loop.
+            return Ok(unsafe { Vec::from_raw_parts(ptr.cast::<T>(), len, capacity) });
+        }
         let mut v = Vec::with_capacity(len);
         for _ in 0..len {
             v.push(T::decode(buf, args.clone())?);
@@ -420,10 +442,14 @@ where
     }
 }
 
-impl<T: BedrockSized> BedrockSized for Vec<T> {
+impl<T: BedrockSized + 'static> BedrockSized for Vec<T> {
     fn encoded_size(&self) -> usize {
         wire::var_u32_len(self.len() as u32)
-            + self.iter().map(BedrockSized::encoded_size).sum::<usize>()
+            + if TypeId::of::<T>() == TypeId::of::<u8>() {
+                self.len()
+            } else {
+                self.iter().map(BedrockSized::encoded_size).sum::<usize>()
+            }
     }
 }
 

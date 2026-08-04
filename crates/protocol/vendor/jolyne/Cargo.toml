@@ -22,7 +22,7 @@ tokio = { version = "1.48", default-features = false, features = ["sync", "time"
 bytes = "1.11"
 thiserror = "1.0"
 valentine = { version = "0.1.0", path = "../valentine", default-features = false, features = ["bedrock_1_26_30"] }
-flate2 = "1.0"
+flate2 = { version = "1.0", default-features = false, features = ["zlib-rs"] }
 snap = "1.1"
 futures = "0.3"
 jsonwebtoken = { version = "9.3", optional = true }

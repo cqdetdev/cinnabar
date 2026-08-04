@@ -40,6 +40,10 @@ func NewFramedConn(conn net.Conn) *FramedConn {
 	return &FramedConn{Conn: conn}
 }
 
+// DisableEncryption keeps the local Rust bridge on its already-private
+// transport without negotiating Bedrock's per-batch AES-CTR wrapper.
+func (c *FramedConn) DisableEncryption() bool { return true }
+
 func newTrackedFramedConn(conn net.Conn, onClose func()) *FramedConn {
 	return &FramedConn{Conn: conn, onClose: onClose}
 }
@@ -85,14 +89,22 @@ func (c *FramedConn) Write(b []byte) (int, error) {
 
 	var header [4]byte
 	binary.BigEndian.PutUint32(header[:], uint32(len(b)))
-	if _, err := writeFull(c.Conn, header[:]); err != nil {
+	written64, err := (net.Buffers{header[:], b}).WriteTo(c.Conn)
+	written := int(written64)
+	if written < len(header) {
+		if err == nil {
+			err = io.ErrNoProgress
+		}
 		return 0, fmt.Errorf("streamnet: write frame header: %w", classifyTerminalError(err))
 	}
-	n, err := writeFull(c.Conn, b)
-	if err != nil {
-		return n, fmt.Errorf("streamnet: write frame payload: %w", classifyTerminalError(err))
+	payloadWritten := written - len(header)
+	if err != nil || payloadWritten != len(b) {
+		if err == nil {
+			err = io.ErrNoProgress
+		}
+		return payloadWritten, fmt.Errorf("streamnet: write frame payload: %w", classifyTerminalError(err))
 	}
-	return n, nil
+	return len(b), nil
 }
 
 func classifyTerminalError(err error) error {
@@ -167,17 +179,3 @@ func validateFrameLength64(length uint64) error {
 	return nil
 }
 
-func writeFull(w io.Writer, p []byte) (int, error) {
-	written := 0
-	for written < len(p) {
-		n, err := w.Write(p[written:])
-		written += n
-		if err != nil {
-			return written, err
-		}
-		if n == 0 {
-			return written, io.ErrNoProgress
-		}
-	}
-	return written, nil
-}

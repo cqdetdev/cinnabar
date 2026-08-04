@@ -131,6 +131,58 @@ impl PalettedStorage {
         Self::new(0, Vec::new(), vec![runtime_id])
     }
 
+    /// Applies one block mutation without rebuilding the whole 4,096-entry
+    /// layer. Existing palette values update their packed word in place; a
+    /// new palette value only repacks when the current bit width is full.
+    pub(crate) fn apply_runtime_update(&mut self, linear: usize, runtime_id: u32) -> bool {
+        debug_assert!(linear < BLOCKS_PER_SUB_CHUNK);
+        let Some(current) = self
+            .palette_index(linear)
+            .and_then(|index| self.palette.get(index))
+        else {
+            return false;
+        };
+        if current == runtime_id {
+            return false;
+        }
+
+        if let Some(index) = self
+            .palette
+            .values
+            .iter()
+            .position(|&value| value == runtime_id)
+        {
+            if self.bits_per_index != 0 {
+                write_palette_index(&mut self.words, self.bits_per_index, linear, index);
+                return true;
+            }
+        }
+
+        let mut values = self.palette.values.to_vec();
+        values.push(runtime_id);
+        let next_bits = bits_for_palette_len(values.len());
+        let mut words = if self.bits_per_index == 0 {
+            vec![0; word_count(next_bits)]
+        } else if next_bits == self.bits_per_index {
+            self.words.to_vec()
+        } else {
+            vec![0; word_count(next_bits)]
+        };
+
+        if self.bits_per_index != 0 && next_bits != self.bits_per_index {
+            for old_linear in 0..BLOCKS_PER_SUB_CHUNK {
+                let old_index = self.palette_index(old_linear).unwrap_or(0);
+                write_palette_index(&mut words, next_bits, old_linear, old_index);
+            }
+        }
+        let new_index = values.len() - 1;
+        write_palette_index(&mut words, next_bits, linear, new_index);
+        self.bits_per_index = next_bits;
+        self.words = words.into_boxed_slice();
+        self.palette.values = values.into_boxed_slice();
+        true
+    }
+
     /// Applies a whole layer's final mutations with one palette-map build and
     /// one packed-word allocation, regardless of duplicate coordinates.
     pub(crate) fn apply_runtime_updates(&mut self, updates: &[(usize, u32)]) -> bool {

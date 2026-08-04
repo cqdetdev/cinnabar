@@ -63,7 +63,7 @@ pub(crate) use session::{
     spawn_network,
 };
 
-pub(crate) const NETWORK_INGRESS_BUDGET_PER_FRAME: usize = 32;
+pub(crate) const NETWORK_INGRESS_BUDGET_PER_FRAME: usize = 128;
 pub(crate) const OUTBOUND_SEND_BUDGET_PER_FRAME: usize = 16;
 const ACTOR_TICK_NANOS: u128 = 50_000_000;
 const _: () = assert!(WORLD_EVENT_CAPACITY >= NETWORK_INGRESS_BUDGET_PER_FRAME);

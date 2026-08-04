@@ -40,7 +40,13 @@ pub struct LightNibbleStorage {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum LightNibbleRepresentation {
     Uniform(u8),
-    Packed(Arc<[u8; PACKED_LIGHT_BYTES]>),
+    Packed {
+        bytes: Arc<[u8; PACKED_LIGHT_BYTES]>,
+        /// The uniform value from which this packed channel was promoted.
+        /// Keeping the baseline and mismatch count makes re-collapse O(1).
+        baseline: u8,
+        mismatched: u16,
+    },
 }
 
 impl LightNibbleStorage {
@@ -60,7 +66,7 @@ impl LightNibbleStorage {
         }
         match &self.representation {
             LightNibbleRepresentation::Uniform(value) => Some(*value),
-            LightNibbleRepresentation::Packed(bytes) => {
+            LightNibbleRepresentation::Packed { bytes, .. } => {
                 let byte = bytes[index / 2];
                 Some(if index & 1 == 0 {
                     byte & 0x0f
@@ -82,20 +88,48 @@ impl LightNibbleStorage {
         }
         if let LightNibbleRepresentation::Uniform(uniform) = &self.representation {
             let byte = *uniform | (*uniform << 4);
-            self.representation =
-                LightNibbleRepresentation::Packed(Arc::new([byte; PACKED_LIGHT_BYTES]));
+            self.representation = LightNibbleRepresentation::Packed {
+                bytes: Arc::new([byte; PACKED_LIGHT_BYTES]),
+                baseline: *uniform,
+                mismatched: 0,
+            };
         }
-        let LightNibbleRepresentation::Packed(bytes) = &mut self.representation else {
-            unreachable!("a differing uniform write always promotes to packed storage")
+        let (baseline_value, should_collapse) = {
+            let LightNibbleRepresentation::Packed {
+                bytes,
+                baseline,
+                mismatched,
+            } = &mut self.representation
+            else {
+                unreachable!("a differing uniform write always promotes to packed storage")
+            };
+            let baseline_value = *baseline;
+            let previous = {
+                let byte = bytes[index / 2];
+                if index & 1 == 0 {
+                    byte & 0x0f
+                } else {
+                    byte >> 4
+                }
+            };
+            let bytes = Arc::make_mut(bytes);
+            let slot = &mut bytes[index / 2];
+            if index & 1 == 0 {
+                *slot = (*slot & 0xf0) | value;
+            } else {
+                *slot = (*slot & 0x0f) | (value << 4);
+            }
+            if previous == baseline_value {
+                *mismatched = (*mismatched).saturating_add(1);
+            }
+            if value == baseline_value {
+                *mismatched = (*mismatched).saturating_sub(1);
+            }
+            (baseline_value, *mismatched == 0)
         };
-        let bytes = Arc::make_mut(bytes);
-        let slot = &mut bytes[index / 2];
-        if index & 1 == 0 {
-            *slot = (*slot & 0xf0) | value;
-        } else {
-            *slot = (*slot & 0x0f) | (value << 4);
+        if should_collapse {
+            self.representation = LightNibbleRepresentation::Uniform(baseline_value);
         }
-        self.collapse_if_uniform();
         Ok(true)
     }
 
@@ -117,7 +151,7 @@ impl LightNibbleStorage {
     pub const fn allocated_bytes(&self) -> usize {
         match &self.representation {
             LightNibbleRepresentation::Uniform(_) => 0,
-            LightNibbleRepresentation::Packed(_) => PACKED_LIGHT_BYTES,
+            LightNibbleRepresentation::Packed { .. } => PACKED_LIGHT_BYTES,
         }
     }
 
@@ -126,20 +160,12 @@ impl LightNibbleStorage {
     pub fn shares_packed_bytes_with(&self, other: &Self) -> bool {
         matches!(
             (&self.representation, &other.representation),
-            (LightNibbleRepresentation::Packed(a), LightNibbleRepresentation::Packed(b))
+            (
+                LightNibbleRepresentation::Packed { bytes: a, .. },
+                LightNibbleRepresentation::Packed { bytes: b, .. },
+            )
                 if Arc::ptr_eq(a, b)
         )
-    }
-
-    fn collapse_if_uniform(&mut self) {
-        let LightNibbleRepresentation::Packed(bytes) = &self.representation else {
-            return;
-        };
-        let first = bytes[0] & 0x0f;
-        let repeated = first | (first << 4);
-        if bytes.iter().all(|&byte| byte == repeated) {
-            self.representation = LightNibbleRepresentation::Uniform(first);
-        }
     }
 }
 

@@ -497,15 +497,19 @@ pub fn run(args: args::ClientArgs) -> Result<()> {
                 poll_model_witness_request,
                 update_camera_medium,
                 update_atmosphere_frame,
-                refresh_cave_visibility,
-                update_visibility_diagnostics.after(ChunkRenderApplySet),
-                emit_world_ready,
-                drive_model_witness,
+                refresh_cave_visibility.after(drive_world_stream),
+                update_visibility_diagnostics
+                    .after(ChunkRenderApplySet)
+                    .after(refresh_cave_visibility),
+                emit_world_ready.after(drive_world_stream),
+                drive_model_witness.after(ChunkRenderApplySet),
                 apply_runtime_vsync_setting,
-                record_metrics_and_title,
-                publish_runtime_stage_profile,
+                record_metrics_and_title
+                    .after(update_visibility_diagnostics)
+                    .after(emit_world_ready)
+                    .after(drive_model_witness),
+                publish_runtime_stage_profile.after(record_metrics_and_title),
             )
-                .chain()
                 .after(FlyCameraUpdateSet),
         )
         .add_systems(Last, arm_shutdown_watchdog);

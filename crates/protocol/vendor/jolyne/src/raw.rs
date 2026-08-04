@@ -8,7 +8,6 @@
 //! - **Passthrough**: Forward unknown/unimplemented packets transparently
 
 use bytes::{Buf, Bytes, BytesMut};
-use valentine::bedrock::codec::BedrockCodec;
 use valentine::bedrock::context::BedrockSession;
 use valentine::protocol::wire;
 
@@ -52,15 +51,15 @@ impl RawPacket {
     /// after initially receiving it as raw bytes.
     pub fn decode(self, session: &BedrockSession) -> Result<McpePacket, JolyneError> {
         let packet_id = self.id;
-        let body_len = self.body.len();
-        let body_preview = self.body.iter().take(32).copied().collect::<Vec<_>>();
+        let body = self.body;
+        let body_len = body.len();
         let mut buf = self.inner_frame;
         let (header, data) =
             McpePacketData::decode_inner(&mut buf, session.into()).map_err(|source| {
                 JolyneError::PacketDecode {
                     packet_id,
                     body_len,
-                    body_preview,
+                    body_preview: body.iter().take(32).copied().collect(),
                     source,
                 }
             })?;
@@ -77,14 +76,14 @@ impl RawPacket {
     /// Decode the inner frame into a borrowed packet view.
     pub fn decode_borrowed(self) -> Result<BorrowedMcpePacket, JolyneError> {
         let packet_id = self.id;
-        let body_len = self.body.len();
-        let body_preview = self.body.iter().take(32).copied().collect::<Vec<_>>();
+        let body = self.body;
+        let body_len = body.len();
         let mut buf = self.inner_frame;
         let (packet, payload_remaining) = BorrowedMcpePacket::decode_inner_with_remaining(&mut buf)
             .map_err(|source| JolyneError::PacketDecode {
                 packet_id,
                 body_len,
-                body_preview,
+                body_preview: body.iter().take(32).copied().collect(),
                 source,
             })?;
         let remaining = buf.remaining() + payload_remaining;
@@ -168,10 +167,7 @@ pub fn decode_packet_raw(cursor: &mut Bytes) -> Result<RawPacket, JolyneError> {
     // BedrockCodec impls. Feeding little-endian bytes breaks IDs >= 128 because
     // packet IDs are encoded as VarUInts on the wire.
     let id_raw = header_raw & 0x3FF;
-    let mut id_buf = BytesMut::new();
-    wire::write_var_u32(&mut id_buf, id_raw);
-    let mut id_cursor = id_buf.freeze();
-    let id = McpePacketName::decode(&mut id_cursor, ()).map_err(|e| {
+    let id = McpePacketName::from_raw(id_raw).map_err(|e| {
         JolyneError::Protocol(ProtocolError::UnexpectedHandshake(format!(
             "unknown packet ID {}: {}",
             id_raw, e

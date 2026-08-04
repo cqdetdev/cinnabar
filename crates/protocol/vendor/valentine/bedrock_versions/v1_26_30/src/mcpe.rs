@@ -278,7 +278,7 @@ impl McpePacketName {
     ///
     /// # Errors
     /// Returns a `DecodeError` if the provided `id` does not correspond to a known packet.
-    fn from_raw(id: u32) -> Result<Self, crate::bedrock::error::DecodeError> {
+    pub fn from_raw(id: u32) -> Result<Self, crate::bedrock::error::DecodeError> {
         match id {
             1u32 => Ok(McpePacketName::PacketLogin),
             2u32 => Ok(McpePacketName::PacketPlayStatus),
