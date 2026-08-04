@@ -153,6 +153,9 @@ pub struct UiPresentationRuntime {
     hud_textures: Option<HudTexturePages>,
     layouts: TextLayoutCache,
     revision: u64,
+    /// Last adapted scene, retained so stable HUD frames reuse their
+    /// revision and GPU-facing allocations instead of forcing an upload.
+    last_input: Option<UiRenderInput>,
     scoreboard: PresentedScoreboardCache,
     scoreboard_owner_names: ScoreboardOwnerNameAuthority,
     scoreboard_opacity: Option<ScoreboardOpacityAuthority>,
@@ -191,6 +194,7 @@ impl UiPresentationRuntime {
             hud_textures,
             layouts: TextLayoutCache::new(TEXT_CACHE_ENTRIES, TEXT_CACHE_BYTES),
             revision: 0,
+            last_input: None,
             scoreboard: PresentedScoreboardCache::default(),
             scoreboard_owner_names: ScoreboardOwnerNameAuthority::default(),
             scoreboard_opacity: None,
@@ -560,9 +564,8 @@ impl UiPresentationRuntime {
         tree.layout(viewport, UiScale::default(), SafeArea::ZERO)
             .map_err(UiPresentationError::Tree)?;
         let mut draw_list = tree.build_draw_list().map_err(UiPresentationError::Tree)?;
-        self.revision = self.revision.saturating_add(1);
-        draw_list.revision = self.revision;
-        let input = adapt_ui_draw_list(
+        draw_list.revision = self.revision.saturating_add(1);
+        let mut input = adapt_ui_draw_list(
             &draw_list,
             Arc::clone(&self.textures),
             UiRenderViewport {
@@ -574,6 +577,20 @@ impl UiPresentationRuntime {
         .map_err(UiPresentationError::Adapter)?;
         self.chat_hit_logical_size = Some([logical_width, logical_height]);
         self.chat_suggestion_hits = chat_suggestion_hits;
+
+        // The adapter creates fresh Arc handles while rebuilding the scene,
+        // so compare the actual render payload while ignoring its revision.
+        // A stable payload keeps the previous revision and lets the render
+        // scene/GPU preparation fast-path skip all buffer uploads.
+        if let Some(previous) = self.last_input.as_ref() {
+            input.revision = previous.revision;
+            if previous == &input {
+                return Ok(previous.clone());
+            }
+        }
+        self.revision = self.revision.saturating_add(1);
+        input.revision = self.revision;
+        self.last_input = Some(input.clone());
         Ok(input)
     }
 }

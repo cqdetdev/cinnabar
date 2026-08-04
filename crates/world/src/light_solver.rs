@@ -325,6 +325,13 @@ pub struct LightSolveStats {
 pub struct LightSolveOutput {
     dimension: i32,
     bounds: LightBounds,
+    y_len: usize,
+    z_len: usize,
+    /// Dense interior samples retained alongside the sub-chunk view. Solver
+    /// consumers commonly read several neighbouring cells from the same
+    /// result; keeping this field avoids routing those reads through a
+    /// sub-chunk map and packed-nibble decode on every sample.
+    values: Box<[[u8; 2]]>,
     sub_chunks: BTreeMap<SubChunkKey, Arc<SubChunkLight>>,
     direct_sky: DensePositionSet,
     stats: LightSolveStats,
@@ -352,10 +359,8 @@ impl LightReadAccess for LightSolveOutput {
         if dimension != self.dimension || !self.bounds.contains(position) {
             return 0;
         }
-        let (key, [x, y, z]) = split_position(dimension, position);
-        self.sub_chunks
-            .get(&key)
-            .and_then(|light| light.get(channel, x, y, z))
+        light_dense_index(self.bounds, self.y_len, self.z_len, position)
+            .map(|index| self.values[index][light_channel_index(channel)])
             .unwrap_or(0)
     }
 
@@ -938,6 +943,9 @@ impl MutableOutput {
         LightSolveOutput {
             dimension: self.bounds.dimension,
             bounds: self.bounds,
+            y_len: self.y_len,
+            z_len: self.z_len,
+            values: self.values,
             sub_chunks: sub_chunks
                 .into_iter()
                 .map(|(key, light)| (key, Arc::new(light)))
