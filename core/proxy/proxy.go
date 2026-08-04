@@ -31,6 +31,12 @@ type Config struct {
 const localRelayBatchPacketLimit = 1600
 const maxInitialTransferHops = 8
 
+var relayBatchPool = sync.Pool{
+	New: func() any {
+		return make([]packet.Packet, 0, localRelayBatchPacketLimit)
+	},
+}
+
 type acceptResult struct {
 	conn net.Conn
 	err  error
@@ -532,13 +538,21 @@ func pumpPacketsWithCacheTelemetry(
 	if err := destination.Flush(); err != nil {
 		return err
 	}
-	outputBatch := make([]packet.Packet, 0, localRelayBatchPacketLimit)
+	outputBatch := relayBatchPool.Get().([]packet.Packet)
+	resetOutputBatch := func() {
+		clear(outputBatch)
+		outputBatch = outputBatch[:0]
+	}
+	defer func() {
+		clear(outputBatch[:cap(outputBatch)])
+		relayBatchPool.Put(outputBatch[:0])
+	}()
 	flushOutputBatch := func() error {
 		if len(outputBatch) == 0 {
 			return nil
 		}
 		err := destination.WritePacketImmediate(outputBatch...)
-		outputBatch = outputBatch[:0]
+		resetOutputBatch()
 		return err
 	}
 	writePacket := func(value packet.Packet) error {

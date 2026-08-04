@@ -1,4 +1,6 @@
-use std::{collections::BTreeMap, sync::Arc};
+use std::sync::Arc;
+
+use hashbrown::HashMap;
 
 use thiserror::Error;
 
@@ -292,7 +294,7 @@ struct StoredSubChunkLight {
 /// Immutable copy-on-write snapshot used by worker jobs.
 #[derive(Debug, Clone, Default)]
 pub struct LightStoreSnapshot {
-    entries: BTreeMap<SubChunkKey, StoredSubChunkLight>,
+    entries: HashMap<SubChunkKey, StoredSubChunkLight>,
 }
 
 impl LightStoreSnapshot {
@@ -328,7 +330,7 @@ impl LightStoreSnapshot {
 /// Sparse light store kept separate from palette-native block storage.
 #[derive(Debug, Default)]
 pub struct LightStore {
-    entries: BTreeMap<SubChunkKey, StoredSubChunkLight>,
+    entries: HashMap<SubChunkKey, StoredSubChunkLight>,
 }
 
 impl LightStore {
