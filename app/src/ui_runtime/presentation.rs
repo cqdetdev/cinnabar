@@ -584,7 +584,7 @@ impl UiPresentationRuntime {
         // scene/GPU preparation fast-path skip all buffer uploads.
         if let Some(previous) = self.last_input.as_ref() {
             input.revision = previous.revision;
-            if previous == &input {
+            if same_render_content(previous, &input) {
                 return Ok(previous.clone());
             }
         }
@@ -593,6 +593,18 @@ impl UiPresentationRuntime {
         self.last_input = Some(input.clone());
         Ok(input)
     }
+}
+
+fn same_render_content(previous: &UiRenderInput, current: &UiRenderInput) -> bool {
+    previous.viewport_size == current.viewport_size
+        && previous.safe_area == current.safe_area
+        && previous.vertices.as_ref() == current.vertices.as_ref()
+        && previous.indices.as_ref() == current.indices.as_ref()
+        && previous.batches.as_ref() == current.batches.as_ref()
+        // The presentation owns one immutable texture array for its entire
+        // lifetime. Pointer identity avoids comparing a potentially large
+        // atlas byte-for-byte on every stable frame.
+        && Arc::ptr_eq(&previous.textures, &current.textures)
 }
 
 #[allow(clippy::too_many_arguments)]
